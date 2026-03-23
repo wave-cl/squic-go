@@ -27,11 +27,14 @@ go get github.com/lyowhs/squic-go
 ### Server
 
 ```go
-// Generate a key pair (distribute pubKey to clients out-of-band)
+// Generate a new key pair (first run)
 cert, pubKey, _ := squic.GenerateKeyPair()
 
+// Or load an existing private key (persistent server identity)
+cert, pubKey, _ := squic.LoadKeyPair("a1b2c3d4...64 hex chars...")
+
 // Listen — server is silent to anyone without pubKey
-ln, _ := squic.Listen("udp", ":4433", cert, pubKey, nil)
+ln, _ := squic.Listen("udp", ":443", cert, pubKey, nil)
 
 conn, _ := ln.Accept(ctx)
 stream, _ := conn.AcceptStream(ctx)

@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"math/big"
@@ -30,6 +31,29 @@ func GenerateKeyPair() (tls.Certificate, []byte, error) {
 	}
 
 	// Return the raw 32-byte Ed25519 public key (not PKIX-wrapped)
+	return cert, []byte(pub), nil
+}
+
+// LoadKeyPair reconstructs a TLS certificate and public key from a hex-encoded
+// Ed25519 private key seed (64 hex characters = 32 bytes).
+// Use this to persist server identity across restarts.
+func LoadKeyPair(privateKeyHex string) (tls.Certificate, []byte, error) {
+	seed, err := hex.DecodeString(privateKeyHex)
+	if err != nil {
+		return tls.Certificate{}, nil, fmt.Errorf("decode hex key: %w", err)
+	}
+	if len(seed) != ed25519.SeedSize {
+		return tls.Certificate{}, nil, fmt.Errorf("key must be %d bytes (got %d)", ed25519.SeedSize, len(seed))
+	}
+
+	priv := ed25519.NewKeyFromSeed(seed)
+	pub := priv.Public().(ed25519.PublicKey)
+
+	cert, err := selfSignedCert(priv, pub)
+	if err != nil {
+		return tls.Certificate{}, nil, fmt.Errorf("self-signed cert: %w", err)
+	}
+
 	return cert, []byte(pub), nil
 }
 

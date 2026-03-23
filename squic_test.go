@@ -1,8 +1,11 @@
 package squic_test
 
 import (
+	"bytes"
 	"context"
+	"crypto"
 	"crypto/rand"
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -53,6 +56,44 @@ func TestGenerateKeyPair(t *testing.T) {
 	}
 	if len(pubKey) == 0 {
 		t.Error("empty public key")
+	}
+}
+
+func TestLoadKeyPair(t *testing.T) {
+	// Generate a key pair, extract the seed, reload it
+	cert1, pubKey1, err := squic.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+
+	// Extract the 32-byte seed from the Ed25519 private key
+	priv := cert1.PrivateKey.(crypto.Signer)
+	edPriv := priv.(interface{ Seed() []byte })
+	seedHex := fmt.Sprintf("%x", edPriv.Seed())
+
+	// Reload from hex
+	cert2, pubKey2, err := squic.LoadKeyPair(seedHex)
+	if err != nil {
+		t.Fatalf("LoadKeyPair: %v", err)
+	}
+
+	if !bytes.Equal(pubKey1, pubKey2) {
+		t.Error("public keys should match after reload")
+	}
+	if len(cert2.Certificate) == 0 {
+		t.Error("empty certificate from LoadKeyPair")
+	}
+}
+
+func TestLoadKeyPairInvalid(t *testing.T) {
+	_, _, err := squic.LoadKeyPair("not-hex")
+	if err == nil {
+		t.Error("expected error for invalid hex")
+	}
+
+	_, _, err = squic.LoadKeyPair("aabb") // too short
+	if err == nil {
+		t.Error("expected error for wrong length")
 	}
 }
 
