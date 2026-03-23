@@ -39,6 +39,10 @@ type Config struct {
 	// Default: 100.
 	MaxIncomingStreams int64
 
+	// NextProtos overrides the TLS ALPN protocol list.
+	// Default: ["squic"]. Set to ["h3"] for HTTP/3.
+	NextProtos []string
+
 	// AllowedKeys is an optional whitelist of client X25519 public keys (32 bytes each).
 	// When set on the server, only clients whose X25519 public keys appear in this
 	// list can connect. Non-whitelisted clients are silently dropped (no response).
@@ -82,6 +86,13 @@ func (c *Config) allowedKeys() [][]byte {
 	return c.AllowedKeys
 }
 
+func (c *Config) nextProtos() []string {
+	if c != nil && len(c.NextProtos) > 0 {
+		return c.NextProtos
+	}
+	return nil
+}
+
 // ServerListener wraps a quic.Listener with silent-server support.
 type ServerListener struct {
 	*quic.Listener
@@ -115,6 +126,9 @@ func Listen(network, addr string, serverCert tls.Certificate, serverPubKey []byt
 	wrappedConn := newServerConn(rawConn, serverX25519Priv, config.allowedKeys())
 
 	tlsConf := ServerTLSConfig(serverCert)
+	if protos := config.nextProtos(); protos != nil {
+		tlsConf.NextProtos = protos
+	}
 	quicConf := config.quicConfig()
 
 	// StatelessResetKey left nil — disables stateless reset for silent server
@@ -249,6 +263,9 @@ func Dial(ctx context.Context, addr string, serverPubKey []byte, config *Config)
 	wrappedConn := newClientConn(rawConn, shared, clientPub)
 
 	tlsConf := ClientTLSConfig(serverPubKey)
+	if protos := config.nextProtos(); protos != nil {
+		tlsConf.NextProtos = protos
+	}
 	quicConf := config.quicConfig()
 
 	tr := &quic.Transport{Conn: wrappedConn}

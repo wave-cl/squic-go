@@ -131,6 +131,23 @@ go run . -c 127.0.0.1 -p 4433 --key <server-pub-hex> -t 30 -R
 go run . -c 127.0.0.1 -p 4433 --key <server-pub-hex> -t 30 -d
 ```
 
+### http3
+
+An HTTP/3 server and client over sQUIC:
+
+```bash
+cd examples/http3
+
+# Server (prints public key on startup)
+go run . -s -p 443
+
+# Client
+go run . -c 127.0.0.1 -p 443 --key <server-pub-hex>
+go run . -c 127.0.0.1 -p 443 --key <server-pub-hex> /health
+```
+
+The server is invisible to port scanners — only clients with the server's public key receive HTTP/3 responses.
+
 ## License
 
 MIT
