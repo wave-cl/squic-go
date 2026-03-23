@@ -1,6 +1,7 @@
 package squic
 
 import (
+	"encoding/binary"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -81,13 +82,15 @@ func (c *clientConn) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int,
 	return c.conn.WriteMsgUDP(b, oob, addr)
 }
 
-// writeInitial appends MAC1 + client pubkey to an Initial packet (WriteTo path).
+// writeInitial appends client pubkey + timestamp + MAC1 to an Initial packet (WriteTo path).
 func (c *clientConn) writeInitial(p []byte, addr *net.UDPAddr) (int, error) {
-	mac := ComputeMAC1(c.sharedSecret, p)
+	ts := NowTimestamp()
+	mac := ComputeMAC1(c.sharedSecret, p, ts)
 	buf := make([]byte, len(p)+MACOverhead)
 	copy(buf, p)
 	copy(buf[len(p):], c.clientPubKey)
-	copy(buf[len(p)+ClientKeySize:], mac)
+	binary.BigEndian.PutUint32(buf[len(p)+ClientKeySize:], ts)
+	copy(buf[len(p)+ClientKeySize+TimestampSize:], mac)
 	n, err := c.conn.WriteToUDP(buf, addr)
 	if err == nil {
 		n = len(p)
@@ -95,13 +98,15 @@ func (c *clientConn) writeInitial(p []byte, addr *net.UDPAddr) (int, error) {
 	return n, err
 }
 
-// writeInitialMsg appends MAC1 + client pubkey to an Initial packet (WriteMsgUDP path).
+// writeInitialMsg appends client pubkey + timestamp + MAC1 to an Initial packet (WriteMsgUDP path).
 func (c *clientConn) writeInitialMsg(b, oob []byte, addr *net.UDPAddr) (int, int, error) {
-	mac := ComputeMAC1(c.sharedSecret, b)
+	ts := NowTimestamp()
+	mac := ComputeMAC1(c.sharedSecret, b, ts)
 	buf := make([]byte, len(b)+MACOverhead)
 	copy(buf, b)
 	copy(buf[len(b):], c.clientPubKey)
-	copy(buf[len(b)+ClientKeySize:], mac)
+	binary.BigEndian.PutUint32(buf[len(b)+ClientKeySize:], ts)
+	copy(buf[len(b)+ClientKeySize+TimestampSize:], mac)
 	n, oobn, err := c.conn.WriteMsgUDP(buf, oob, addr)
 	if err == nil {
 		n = len(b)
@@ -245,9 +250,16 @@ func (c *serverConn) validateAndStrip(p []byte, n int) (bool, int) {
 
 	quicLen := n - MACOverhead
 	clientPub := p[quicLen : quicLen+ClientKeySize]
-	mac1 := p[quicLen+ClientKeySize : n]
+	tsBytes := p[quicLen+ClientKeySize : quicLen+ClientKeySize+TimestampSize]
+	mac1 := p[quicLen+ClientKeySize+TimestampSize : n]
+	timestamp := binary.BigEndian.Uint32(tsBytes)
 
-	// Step 1: Whitelist check (fast map lookup, before expensive DH)
+	// Step 1: Replay protection — reject timestamps outside window
+	if !TimestampInWindow(timestamp, NowTimestamp()) {
+		return false, 0
+	}
+
+	// Step 2: Whitelist check (fast map lookup, before expensive DH)
 	c.keysMu.RLock()
 	keys := c.allowedKeys
 	c.keysMu.RUnlock()
@@ -259,13 +271,13 @@ func (c *serverConn) validateAndStrip(p []byte, n int) (bool, int) {
 		}
 	}
 
-	// Step 2: DH + MAC1 verification
+	// Step 3: DH + MAC1 verification (includes timestamp in MAC input)
 	shared, dhErr := X25519(c.serverX25519Priv, clientPub)
 	if dhErr != nil {
 		return false, 0
 	}
 
-	if !VerifyMAC1(shared, p[:quicLen], mac1) {
+	if !VerifyMAC1(shared, p[:quicLen], timestamp, mac1) {
 		return false, 0
 	}
 

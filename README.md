@@ -1,10 +1,11 @@
 # sQUIC — Sovereign QUIC
 
-sQUIC is an extension of QUIC that adds three features:
+sQUIC is an extension of QUIC that adds four features:
 
 1. **Silent server** — the server is invisible to port scanners. Only clients that possess the server's public key can elicit a response.
 2. **No CA/PKI** — identity is a pinned Ed25519 public key (32 bytes), not a certificate chain. No certificate authorities.
 3. **Client whitelisting** — optionally restrict connections to a set of known client public keys, manageable at runtime. Add, remove, and query keys without restarting the server. Non-whitelisted clients are silently dropped at the MAC layer — no handshake, no state, no response.
+4. **Replay protection** — a timestamp is included in the MAC computation. The server rejects Initial packets older than 120 seconds, preventing replay attacks. QUIC's own connection ID deduplication provides additional protection within the window.
 
 Everything else is standard QUIC — streams, flow control, congestion control, connection migration, 0-RTT — all provided by quic-go with zero modifications.
 

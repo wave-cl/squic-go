@@ -19,21 +19,22 @@ func TestMAC1RoundTrip(t *testing.T) {
 	rand.Read(sharedSecret)
 
 	data := []byte("test packet data")
-	mac := squic.ComputeMAC1(sharedSecret, data)
+	ts := squic.NowTimestamp()
+	mac := squic.ComputeMAC1(sharedSecret, data, ts)
 
 	if len(mac) != squic.MACSize {
 		t.Fatalf("MAC1 length = %d, want %d", len(mac), squic.MACSize)
 	}
 
 	// Verify MAC1
-	if !squic.VerifyMAC1(sharedSecret, data, mac) {
+	if !squic.VerifyMAC1(sharedSecret, data, ts, mac) {
 		t.Error("valid MAC1 failed verification")
 	}
 
 	// Wrong key should fail
 	wrongKey := make([]byte, 32)
 	rand.Read(wrongKey)
-	if squic.VerifyMAC1(wrongKey, data, mac) {
+	if squic.VerifyMAC1(wrongKey, data, ts, mac) {
 		t.Error("MAC1 should fail with wrong key")
 	}
 
@@ -41,8 +42,47 @@ func TestMAC1RoundTrip(t *testing.T) {
 	tampered := make([]byte, len(data))
 	copy(tampered, data)
 	tampered[0] ^= 0xFF
-	if squic.VerifyMAC1(sharedSecret, tampered, mac) {
+	if squic.VerifyMAC1(sharedSecret, tampered, ts, mac) {
 		t.Error("MAC1 should fail with tampered data")
+	}
+
+	// Wrong timestamp should fail
+	if squic.VerifyMAC1(sharedSecret, data, ts+1, mac) {
+		t.Error("MAC1 should fail with different timestamp")
+	}
+}
+
+func TestTimestampReplayWindow(t *testing.T) {
+	now := squic.NowTimestamp()
+
+	// Current time: valid
+	if !squic.TimestampInWindow(now, now) {
+		t.Error("current timestamp should be valid")
+	}
+
+	// 60 seconds ago: valid
+	if !squic.TimestampInWindow(now-60, now) {
+		t.Error("60s old timestamp should be valid")
+	}
+
+	// 119 seconds ago: valid (within 120s window)
+	if !squic.TimestampInWindow(now-119, now) {
+		t.Error("119s old timestamp should be valid")
+	}
+
+	// 121 seconds ago: invalid (outside 120s window)
+	if squic.TimestampInWindow(now-121, now) {
+		t.Error("121s old timestamp should be rejected")
+	}
+
+	// 60 seconds in the future: valid (clock skew tolerance)
+	if !squic.TimestampInWindow(now+60, now) {
+		t.Error("60s future timestamp should be valid")
+	}
+
+	// 121 seconds in the future: invalid
+	if squic.TimestampInWindow(now+121, now) {
+		t.Error("121s future timestamp should be rejected")
 	}
 }
 
