@@ -49,8 +49,40 @@ type Config struct {
 	// When nil, any client that knows the server's public key can connect.
 	AllowedKeys [][]byte
 
+	// KeepAlive sends periodic keep-alive packets to prevent idle timeout.
+	// Default: disabled (zero value).
+	KeepAlive time.Duration
+
+	// HandshakeTimeout is the maximum time for the TLS handshake to complete.
+	// Default: 5 seconds.
+	HandshakeTimeout time.Duration
+
+	// MaxStreamReceiveWindow is the maximum per-stream flow control window.
+	// Default: 6 MB.
+	MaxStreamReceiveWindow uint64
+
+	// MaxConnectionReceiveWindow is the maximum connection-level flow control window.
+	// Default: 15 MB.
+	MaxConnectionReceiveWindow uint64
+
+	// InitialMTU sets the initial UDP payload size. Range: 1200-65000.
+	// Default: 1200.
+	InitialMTU uint16
+
+	// DisableMTUDiscovery disables RFC 8899 path MTU discovery.
+	// Default: false (discovery enabled).
+	DisableMTUDiscovery bool
+
+	// EnableDatagrams enables RFC 9221 QUIC datagram support.
+	// Default: false.
+	EnableDatagrams bool
+
+	// Enable0RTT allows 0-RTT resumption. Has replay attack implications.
+	// Default: false.
+	Enable0RTT bool
+
 	// QuicConfig allows passing additional quic-go configuration.
-	// If nil, sensible defaults are used.
+	// If nil, sensible defaults are used. Overrides all other fields.
 	QuicConfig *quic.Config
 }
 
@@ -70,13 +102,42 @@ func (c *Config) quicConfig() *quic.Config {
 		}
 	}
 
-	return &quic.Config{
+	qc := &quic.Config{
 		MaxIdleTimeout:                 timeout,
-		MaxIncomingStreams:             maxStreams,
-		MaxIncomingUniStreams:          maxStreams,
-		InitialStreamReceiveWindow:    1 << 20,  // 1MB
+		MaxIncomingStreams:              maxStreams,
+		MaxIncomingUniStreams:           maxStreams,
+		InitialStreamReceiveWindow:     1 << 20,  // 1MB
 		InitialConnectionReceiveWindow: 10 << 20, // 10MB
 	}
+
+	if c != nil {
+		if c.KeepAlive > 0 {
+			qc.KeepAlivePeriod = c.KeepAlive
+		}
+		if c.HandshakeTimeout > 0 {
+			qc.HandshakeIdleTimeout = c.HandshakeTimeout
+		}
+		if c.MaxStreamReceiveWindow > 0 {
+			qc.MaxStreamReceiveWindow = c.MaxStreamReceiveWindow
+		}
+		if c.MaxConnectionReceiveWindow > 0 {
+			qc.MaxConnectionReceiveWindow = c.MaxConnectionReceiveWindow
+		}
+		if c.InitialMTU > 0 {
+			qc.InitialPacketSize = c.InitialMTU
+		}
+		if c.DisableMTUDiscovery {
+			qc.DisablePathMTUDiscovery = true
+		}
+		if c.EnableDatagrams {
+			qc.EnableDatagrams = true
+		}
+		if c.Enable0RTT {
+			qc.Allow0RTT = true
+		}
+	}
+
+	return qc
 }
 
 func (c *Config) allowedKeys() [][]byte {
