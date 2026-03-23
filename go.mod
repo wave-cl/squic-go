@@ -1,4 +1,4 @@
-module github.com/lyowhs/squic-go
+module github.com/wave-cl/squic-go
 
 go 1.26.1
 

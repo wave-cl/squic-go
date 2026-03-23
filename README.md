@@ -19,7 +19,7 @@ The implementation wraps quic-go as an unmodified dependency rather than forking
 ## Install
 
 ```
-go get github.com/lyowhs/squic-go
+go get github.com/wave-cl/squic-go
 ```
 
 ## Usage

@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	squic "github.com/lyowhs/squic-go"
+	squic "github.com/wave-cl/squic-go"
 	"github.com/quic-go/quic-go"
 )
 

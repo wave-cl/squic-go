@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	squic "github.com/lyowhs/squic-go"
+	squic "github.com/wave-cl/squic-go"
 )
 
 func TestMAC1RoundTrip(t *testing.T) {
