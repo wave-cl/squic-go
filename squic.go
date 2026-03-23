@@ -86,6 +86,7 @@ func (c *Config) allowedKeys() [][]byte {
 type ServerListener struct {
 	*quic.Listener
 	conn net.PacketConn
+	sc   *serverConn
 }
 
 // Listen creates a sQUIC listener on the given address.
@@ -124,7 +125,77 @@ func Listen(network, addr string, serverCert tls.Certificate, serverPubKey []byt
 		return nil, fmt.Errorf("squic: quic listen: %w", err)
 	}
 
-	return &ServerListener{Listener: ln, conn: rawConn}, nil
+	return &ServerListener{Listener: ln, conn: rawConn, sc: wrappedConn}, nil
+}
+
+// AllowKey adds a client X25519 public key to the whitelist at runtime.
+// If whitelisting is not enabled, this implicitly enables it.
+// The key must be exactly 32 bytes.
+func (sl *ServerListener) AllowKey(pubKey []byte) error {
+	if len(pubKey) != 32 {
+		return fmt.Errorf("squic: key must be 32 bytes, got %d", len(pubKey))
+	}
+	var key [32]byte
+	copy(key[:], pubKey)
+	sl.sc.addKey(key)
+	return nil
+}
+
+// RemoveKey removes a client X25519 public key from the whitelist at runtime.
+// The key must be exactly 32 bytes.
+func (sl *ServerListener) RemoveKey(pubKey []byte) error {
+	if len(pubKey) != 32 {
+		return fmt.Errorf("squic: key must be 32 bytes, got %d", len(pubKey))
+	}
+	var key [32]byte
+	copy(key[:], pubKey)
+	sl.sc.removeKey(key)
+	return nil
+}
+
+// HasKey checks if a client X25519 public key is in the whitelist.
+func (sl *ServerListener) HasKey(pubKey []byte) bool {
+	if len(pubKey) != 32 {
+		return false
+	}
+	var key [32]byte
+	copy(key[:], pubKey)
+	return sl.sc.hasKey(key)
+}
+
+// AllowedKeys returns a copy of all whitelisted client X25519 public keys.
+// Returns nil if whitelisting is not enabled.
+func (sl *ServerListener) AllowedKeys() [][]byte {
+	keys := sl.sc.allKeys()
+	if keys == nil {
+		return nil
+	}
+	result := make([][]byte, len(keys))
+	for i, k := range keys {
+		result[i] = k[:]
+	}
+	return result
+}
+
+// EnableWhitelist activates the client key whitelist, optionally pre-populated with keys.
+// Once enabled, only clients whose X25519 public keys are in the whitelist can connect.
+// If no keys are provided, the whitelist starts empty (blocks all new connections).
+func (sl *ServerListener) EnableWhitelist(keys ...[]byte) {
+	var fixed [][32]byte
+	for _, k := range keys {
+		if len(k) == 32 {
+			var key [32]byte
+			copy(key[:], k)
+			fixed = append(fixed, key)
+		}
+	}
+	sl.sc.enableWhitelist(fixed)
+}
+
+// DisableWhitelist removes the whitelist entirely.
+// Any client with a valid MAC1 (knowing the server's public key) can connect.
+func (sl *ServerListener) DisableWhitelist() {
+	sl.sc.disableWhitelist()
 }
 
 // Close closes the listener and the underlying connection.

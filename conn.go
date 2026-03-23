@@ -2,6 +2,7 @@ package squic
 
 import (
 	"net"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -115,6 +116,7 @@ func (c *clientConn) writeInitialMsg(b, oob []byte, addr *net.UDPAddr) (int, int
 type serverConn struct {
 	conn             *net.UDPConn
 	serverX25519Priv []byte            // server's X25519 private key
+	keysMu           sync.RWMutex      // protects allowedKeys
 	allowedKeys      map[[32]byte]bool  // optional whitelist of client X25519 public keys
 	batchReader      *ipv4.PacketConn   // lazy-initialized for ReadBatch
 }
@@ -246,10 +248,13 @@ func (c *serverConn) validateAndStrip(p []byte, n int) (bool, int) {
 	mac1 := p[quicLen+ClientKeySize : n]
 
 	// Step 1: Whitelist check (fast map lookup, before expensive DH)
-	if c.allowedKeys != nil {
+	c.keysMu.RLock()
+	keys := c.allowedKeys
+	c.keysMu.RUnlock()
+	if keys != nil {
 		var key [32]byte
 		copy(key[:], clientPub)
-		if !c.allowedKeys[key] {
+		if !keys[key] {
 			return false, 0
 		}
 	}
@@ -265,4 +270,69 @@ func (c *serverConn) validateAndStrip(p []byte, n int) (bool, int) {
 	}
 
 	return true, quicLen
+}
+
+// addKey adds a client public key to the whitelist.
+// Initializes the map if it was nil (implicitly enables whitelisting).
+func (c *serverConn) addKey(key [32]byte) {
+	c.keysMu.Lock()
+	defer c.keysMu.Unlock()
+	if c.allowedKeys == nil {
+		c.allowedKeys = make(map[[32]byte]bool)
+	}
+	c.allowedKeys[key] = true
+}
+
+// removeKey removes a client public key from the whitelist.
+func (c *serverConn) removeKey(key [32]byte) {
+	c.keysMu.Lock()
+	defer c.keysMu.Unlock()
+	if c.allowedKeys != nil {
+		delete(c.allowedKeys, key)
+	}
+}
+
+// hasKey checks if a client public key is in the whitelist.
+func (c *serverConn) hasKey(key [32]byte) bool {
+	c.keysMu.RLock()
+	defer c.keysMu.RUnlock()
+	if c.allowedKeys == nil {
+		return false
+	}
+	return c.allowedKeys[key]
+}
+
+// allKeys returns a copy of all whitelisted keys.
+func (c *serverConn) allKeys() [][32]byte {
+	c.keysMu.RLock()
+	defer c.keysMu.RUnlock()
+	if c.allowedKeys == nil {
+		return nil
+	}
+	keys := make([][32]byte, 0, len(c.allowedKeys))
+	for k := range c.allowedKeys {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// enableWhitelist initializes the whitelist with optional pre-populated keys.
+// If the whitelist is already active, the provided keys are added to it.
+func (c *serverConn) enableWhitelist(keys [][32]byte) {
+	c.keysMu.Lock()
+	defer c.keysMu.Unlock()
+	if c.allowedKeys == nil {
+		c.allowedKeys = make(map[[32]byte]bool, len(keys))
+	}
+	for _, k := range keys {
+		c.allowedKeys[k] = true
+	}
+}
+
+// disableWhitelist removes the whitelist entirely.
+// All clients with a valid MAC1 will be allowed.
+func (c *serverConn) disableWhitelist() {
+	c.keysMu.Lock()
+	defer c.keysMu.Unlock()
+	c.allowedKeys = nil
 }

@@ -373,3 +373,154 @@ func TestWhitelistDHCannotBeForged(t *testing.T) {
 		t.Error("server should not accept forged client identity")
 	}
 }
+
+func TestRuntimeAllowKey(t *testing.T) {
+	serverCert, serverPub, err := squic.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+
+	// Start with whitelist enabled but empty — blocks all clients
+	ln, err := squic.Listen("udp", "127.0.0.1:0", serverCert, serverPub, nil)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+	ln.EnableWhitelist() // empty whitelist = block all
+
+	serverAddr := ln.Addr().String()
+
+	// Attempt 1: should fail (empty whitelist)
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel1()
+	_, err = squic.Dial(ctx1, serverAddr, serverPub, nil)
+	if err == nil {
+		t.Fatal("expected dial to fail with empty whitelist")
+	}
+
+	// Now disable whitelist — should allow any valid MAC1 client
+	ln.DisableWhitelist()
+
+	// Accept goroutine
+	accepted := make(chan struct{})
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, err := ln.Accept(ctx)
+		if err != nil {
+			return
+		}
+		conn.CloseWithError(0, "")
+		close(accepted)
+	}()
+
+	// Attempt 2: should succeed
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	conn, err := squic.Dial(ctx2, serverAddr, serverPub, nil)
+	if err != nil {
+		t.Fatalf("Dial after DisableWhitelist should succeed: %v", err)
+	}
+	conn.CloseWithError(0, "")
+
+	select {
+	case <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not accept connection")
+	}
+}
+
+func TestRuntimeRemoveKey(t *testing.T) {
+	serverCert, serverPub, err := squic.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+
+	ln, err := squic.Listen("udp", "127.0.0.1:0", serverCert, serverPub, nil)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+
+	serverAddr := ln.Addr().String()
+
+	// Verify HasKey returns false for non-existent key
+	fakeKey := make([]byte, 32)
+	rand.Read(fakeKey)
+	if ln.HasKey(fakeKey) {
+		t.Fatal("HasKey should return false for unknown key")
+	}
+
+	// Verify AllowedKeys returns nil when whitelist is disabled
+	if keys := ln.AllowedKeys(); keys != nil {
+		t.Fatalf("AllowedKeys should be nil when whitelist disabled, got %d keys", len(keys))
+	}
+
+	// Enable whitelist with a key, then remove it
+	ln.EnableWhitelist(fakeKey)
+	if !ln.HasKey(fakeKey) {
+		t.Fatal("HasKey should return true after EnableWhitelist with key")
+	}
+	if keys := ln.AllowedKeys(); len(keys) != 1 {
+		t.Fatalf("expected 1 allowed key, got %d", len(keys))
+	}
+
+	ln.RemoveKey(fakeKey)
+	if ln.HasKey(fakeKey) {
+		t.Fatal("HasKey should return false after RemoveKey")
+	}
+
+	// Whitelist is now enabled but empty — connection should fail
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	_, err = squic.Dial(ctx, serverAddr, serverPub, nil)
+	if err == nil {
+		t.Fatal("expected dial to fail after key removed from whitelist")
+	}
+}
+
+func TestEnableWhitelistWithKeys(t *testing.T) {
+	serverCert, serverPub, err := squic.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+
+	ln, err := squic.Listen("udp", "127.0.0.1:0", serverCert, serverPub, nil)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+
+	// Enable with multiple keys
+	key1 := make([]byte, 32)
+	key2 := make([]byte, 32)
+	rand.Read(key1)
+	rand.Read(key2)
+
+	ln.EnableWhitelist(key1, key2)
+
+	if !ln.HasKey(key1) || !ln.HasKey(key2) {
+		t.Fatal("both keys should be in whitelist")
+	}
+	if keys := ln.AllowedKeys(); len(keys) != 2 {
+		t.Fatalf("expected 2 keys, got %d", len(keys))
+	}
+
+	// Add a third key at runtime
+	key3 := make([]byte, 32)
+	rand.Read(key3)
+	ln.AllowKey(key3)
+
+	if !ln.HasKey(key3) {
+		t.Fatal("key3 should be in whitelist after AllowKey")
+	}
+	if keys := ln.AllowedKeys(); len(keys) != 3 {
+		t.Fatalf("expected 3 keys, got %d", len(keys))
+	}
+
+	// Disable entirely
+	ln.DisableWhitelist()
+	if keys := ln.AllowedKeys(); keys != nil {
+		t.Fatal("AllowedKeys should be nil after DisableWhitelist")
+	}
+}
