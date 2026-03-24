@@ -21,6 +21,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"time"
@@ -84,6 +85,11 @@ type Config struct {
 	// SendWindow is the maximum bytes of unacknowledged stream data.
 	// Default: 0 (library default).
 	SendWindow uint64
+
+	// ClientKey is an optional hex-encoded Ed25519 private key seed (64 hex chars).
+	// When set, Dial() uses this persistent identity instead of generating an ephemeral one.
+	// The client's X25519 public key is derived from this for MAC1 and whitelist matching.
+	ClientKey string
 
 	// QuicConfig allows passing additional quic-go configuration.
 	// If nil, sensible defaults are used. Overrides all other fields.
@@ -308,11 +314,26 @@ func Dial(ctx context.Context, addr string, serverPubKey []byte, config *Config)
 		return nil, fmt.Errorf("squic: convert server key: %w", err)
 	}
 
-	// Generate ephemeral X25519 key pair for this connection
+	// Derive or generate X25519 key pair for this connection
 	var clientPriv [32]byte
-	if _, err := rand.Read(clientPriv[:]); err != nil {
-		rawConn.Close()
-		return nil, fmt.Errorf("squic: generate client key: %w", err)
+	if config != nil && config.ClientKey != "" {
+		// Persistent client identity: derive X25519 from Ed25519 seed
+		ed25519Pub, err := hex.DecodeString(config.ClientKey)
+		if err != nil || len(ed25519Pub) != ed25519.SeedSize {
+			rawConn.Close()
+			return nil, fmt.Errorf("squic: invalid ClientKey (expected %d hex chars)", ed25519.SeedSize*2)
+		}
+		priv := ed25519.NewKeyFromSeed(ed25519Pub)
+		pub := priv.Public().(ed25519.PublicKey)
+		x25519Priv := Ed25519PrivateToX25519(priv)
+		copy(clientPriv[:], x25519Priv)
+		_ = pub // Ed25519 public key available if needed for TLS cert
+	} else {
+		// Ephemeral: random X25519 key pair
+		if _, err := rand.Read(clientPriv[:]); err != nil {
+			rawConn.Close()
+			return nil, fmt.Errorf("squic: generate client key: %w", err)
+		}
 	}
 	clientPub, err := curve25519.X25519(clientPriv[:], curve25519.Basepoint)
 	if err != nil {
