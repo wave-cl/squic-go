@@ -56,7 +56,7 @@ stream.Write([]byte("hello"))
 
 sQUIC wraps the UDP socket (`net.PacketConn`) that quic-go uses:
 
-- **Client side**: Each connection generates an ephemeral X25519 key pair. Outgoing QUIC Initial packets get a 32-byte client public key + 16-byte MAC1 appended. MAC1 is computed using a DH shared secret (`X25519(clientPriv, serverPub)`), proving the client knows the server's public key.
+- **Client side**: Each connection uses an ephemeral or persistent X25519 key pair. Outgoing QUIC Initial packets get a 32-byte client public key + 4-byte timestamp + 16-byte MAC1 appended. MAC1 is computed using a DH shared secret (`X25519(clientPriv, serverPub)`), proving the client knows the server's public key. Set `Config.ClientKey` (hex Ed25519 seed) for a persistent identity that survives reconnects.
 - **Server side**: Validates MAC1 on incoming Initial packets via DH (`X25519(serverPriv, clientPub)`). Invalid MAC1 → silently dropped (no response). Valid MAC1 → stripped and passed to quic-go.
 - **Client key whitelisting** (optional): The server can restrict connections to a set of known client X25519 public keys. Non-whitelisted clients are silently dropped — the server remains fully invisible to them.
 
@@ -96,6 +96,23 @@ ln.DisableWhitelist()
 ```
 
 Non-whitelisted clients are silently dropped at the MAC1 layer — no TLS handshake, no state allocation, no response. The server remains fully invisible.
+
+## Persistent client identity
+
+By default, clients generate an ephemeral key pair per connection. To use a stable identity (required for server-side whitelisting):
+
+```go
+// Generate a client key pair (once, save the seed)
+_, clientPub, _ := squic.GenerateKeyPair()
+clientSeed := hex.EncodeToString(clientPrivateKeySeed) // 64 hex chars
+
+// Connect with persistent identity
+conn, _ := squic.Dial(ctx, "server:4433", serverPubKey, &squic.Config{
+    ClientKey: clientSeed, // same X25519 pubkey every connection
+})
+```
+
+The server can then whitelist this client's X25519 public key (derived from the Ed25519 key).
 
 ## Performance
 
