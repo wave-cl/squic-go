@@ -78,19 +78,9 @@ type Config struct {
 	// Default: false.
 	EnableDatagrams bool
 
-	// DisableActiveMigration disables active connection migration (RFC 9000 §9).
-	// Default: false.
-	// Note: quic-go does not expose this as a config option. This field exists
-	// for API compatibility with squic-rust. quic-go always allows migration.
-	DisableActiveMigration bool
-
 	// Enable0RTT allows 0-RTT resumption. Has replay attack implications.
 	// Default: false.
 	Enable0RTT bool
-
-	// SendWindow is the maximum bytes of unacknowledged stream data.
-	// Default: 0 (library default).
-	SendWindow uint64
 
 	// ClientKey is an optional hex-encoded Ed25519 private key seed (64 hex chars).
 	// When set, Dial() uses this persistent identity instead of generating an ephemeral one.
@@ -150,9 +140,6 @@ func (c *Config) quicConfig() *quic.Config {
 		}
 		if c.Enable0RTT {
 			qc.Allow0RTT = true
-		}
-		if c.SendWindow > 0 {
-			qc.InitialConnectionReceiveWindow = c.SendWindow
 		}
 	}
 
