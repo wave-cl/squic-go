@@ -78,6 +78,12 @@ type Config struct {
 	// Default: false.
 	EnableDatagrams bool
 
+	// DisableActiveMigration disables active connection migration (RFC 9000 §9).
+	// Default: false.
+	// Note: quic-go does not expose this as a config option. This field exists
+	// for API compatibility with squic-rust. quic-go always allows migration.
+	DisableActiveMigration bool
+
 	// Enable0RTT allows 0-RTT resumption. Has replay attack implications.
 	// Default: false.
 	Enable0RTT bool
