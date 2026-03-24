@@ -54,7 +54,7 @@ type Config struct {
 	KeepAlive time.Duration
 
 	// HandshakeTimeout is the maximum time for the TLS handshake to complete.
-	// Default: 5 seconds.
+	// Default: 10 seconds.
 	HandshakeTimeout time.Duration
 
 	// MaxStreamReceiveWindow is the maximum per-stream flow control window.
@@ -80,6 +80,10 @@ type Config struct {
 	// Enable0RTT allows 0-RTT resumption. Has replay attack implications.
 	// Default: false.
 	Enable0RTT bool
+
+	// SendWindow is the maximum bytes of unacknowledged stream data.
+	// Default: 0 (library default).
+	SendWindow uint64
 
 	// QuicConfig allows passing additional quic-go configuration.
 	// If nil, sensible defaults are used. Overrides all other fields.
@@ -134,6 +138,9 @@ func (c *Config) quicConfig() *quic.Config {
 		}
 		if c.Enable0RTT {
 			qc.Allow0RTT = true
+		}
+		if c.SendWindow > 0 {
+			qc.InitialConnectionReceiveWindow = c.SendWindow
 		}
 	}
 
