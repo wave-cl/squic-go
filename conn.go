@@ -108,19 +108,25 @@ func (c *clientConn) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int,
 // buildInitial constructs the Initial packet with MAC1 + MAC2 appended.
 func (c *clientConn) buildInitial(p []byte) []byte {
 	ts := NowTimestamp()
-	mac1 := ComputeMAC1(c.sharedSecret, p, ts)
+	nonce, _ := GenerateNonce()
+	mac1 := ComputeMAC1(c.sharedSecret, p, ts, nonce)
 
 	buf := make([]byte, len(p)+MACOverhead)
 	copy(buf, p)
-	copy(buf[len(p):], c.clientPubKey)
-	binary.BigEndian.PutUint32(buf[len(p)+ClientKeySize:], ts)
-	copy(buf[len(p)+ClientKeySize+TimestampSize:], mac1)
+	off := len(p)
+	copy(buf[off:], c.clientPubKey)
+	off += ClientKeySize
+	binary.BigEndian.PutUint32(buf[off:], ts)
+	off += TimestampSize
+	copy(buf[off:], nonce)
+	off += NonceSize
+	copy(buf[off:], mac1)
+	off += MACSize
 
 	// MAC2: zeros if no cookie, computed if cookie available
-	mac2Start := len(p) + ClientKeySize + TimestampSize + MACSize
 	if cookie, ok := c.cookie.Load().([]byte); ok && len(cookie) > 0 {
-		mac2 := ComputeMAC2(cookie, buf[:mac2Start], mac1)
-		copy(buf[mac2Start:], mac2)
+		mac2 := ComputeMAC2(cookie, buf[:off], mac1)
+		copy(buf[off:], mac2)
 	}
 	// else: MAC2 field is already zeros from make()
 
@@ -344,11 +350,17 @@ func (c *serverConn) validateAndStrip(p []byte, n int, addr *net.UDPAddr) (bool,
 	}
 
 	quicLen := n - MACOverhead
-	clientPub := p[quicLen : quicLen+ClientKeySize]
-	tsBytes := p[quicLen+ClientKeySize : quicLen+ClientKeySize+TimestampSize]
-	mac1Start := quicLen + ClientKeySize + TimestampSize
-	mac1 := p[mac1Start : mac1Start+MACSize]
-	mac2 := p[mac1Start+MACSize : n]
+	off := quicLen
+	clientPub := p[off : off+ClientKeySize]
+	off += ClientKeySize
+	tsBytes := p[off : off+TimestampSize]
+	off += TimestampSize
+	nonce := p[off : off+NonceSize]
+	off += NonceSize
+	mac1Start := off
+	mac1 := p[off : off+MACSize]
+	off += MACSize
+	mac2 := p[off : n]
 	timestamp := binary.BigEndian.Uint32(tsBytes)
 
 	// Step 1: Replay protection — reject timestamps outside window (cheap)
@@ -410,7 +422,7 @@ func (c *serverConn) validateAndStrip(p []byte, n int, addr *net.UDPAddr) (bool,
 		return false, 0
 	}
 
-	if !VerifyMAC1(shared, p[:quicLen], timestamp, mac1) {
+	if !VerifyMAC1(shared, p[:quicLen], timestamp, nonce, mac1) {
 		return false, 0
 	}
 

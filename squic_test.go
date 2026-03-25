@@ -20,21 +20,22 @@ func TestMAC1RoundTrip(t *testing.T) {
 
 	data := []byte("test packet data")
 	ts := squic.NowTimestamp()
-	mac := squic.ComputeMAC1(sharedSecret, data, ts)
+	nonce, _ := squic.GenerateNonce()
+	mac := squic.ComputeMAC1(sharedSecret, data, ts, nonce)
 
 	if len(mac) != squic.MACSize {
 		t.Fatalf("MAC1 length = %d, want %d", len(mac), squic.MACSize)
 	}
 
 	// Verify MAC1
-	if !squic.VerifyMAC1(sharedSecret, data, ts, mac) {
+	if !squic.VerifyMAC1(sharedSecret, data, ts, nonce, mac) {
 		t.Error("valid MAC1 failed verification")
 	}
 
 	// Wrong key should fail
 	wrongKey := make([]byte, 32)
 	rand.Read(wrongKey)
-	if squic.VerifyMAC1(wrongKey, data, ts, mac) {
+	if squic.VerifyMAC1(wrongKey, data, ts, nonce, mac) {
 		t.Error("MAC1 should fail with wrong key")
 	}
 
@@ -42,13 +43,20 @@ func TestMAC1RoundTrip(t *testing.T) {
 	tampered := make([]byte, len(data))
 	copy(tampered, data)
 	tampered[0] ^= 0xFF
-	if squic.VerifyMAC1(sharedSecret, tampered, ts, mac) {
+	if squic.VerifyMAC1(sharedSecret, tampered, ts, nonce, mac) {
 		t.Error("MAC1 should fail with tampered data")
 	}
 
 	// Wrong timestamp should fail
-	if squic.VerifyMAC1(sharedSecret, data, ts+1, mac) {
+	if squic.VerifyMAC1(sharedSecret, data, ts+1, nonce, mac) {
 		t.Error("MAC1 should fail with different timestamp")
+	}
+
+	// Wrong nonce should fail
+	wrongNonce := make([]byte, squic.NonceSize)
+	rand.Read(wrongNonce)
+	if squic.VerifyMAC1(sharedSecret, data, ts, wrongNonce, mac) {
+		t.Error("MAC1 should fail with different nonce")
 	}
 }
 

@@ -23,12 +23,15 @@ const (
 	// TimestampSize is the size of the replay-protection timestamp (uint32 epoch seconds).
 	TimestampSize = 4
 
+	// NonceSize is the size of the random nonce in bytes.
+	NonceSize = 8
+
 	// MAC2Size is the size of the MAC2 tag in bytes.
 	MAC2Size = 16
 
 	// MACOverhead is the total overhead appended to Initial packets:
-	// 32-byte client X25519 public key + 4-byte timestamp + 16-byte MAC1 + 16-byte MAC2.
-	MACOverhead = ClientKeySize + TimestampSize + MACSize + MAC2Size
+	// 32-byte client X25519 public key + 4-byte timestamp + 8-byte nonce + 16-byte MAC1 + 16-byte MAC2.
+	MACOverhead = ClientKeySize + TimestampSize + NonceSize + MACSize + MAC2Size
 
 	// CookieReplyType is the first byte of a cookie reply packet.
 	// Distinguishes from QUIC packets (Initial starts with 0xC0+).
@@ -42,21 +45,31 @@ const (
 	ReplayWindow = 120 * time.Second
 )
 
-// ComputeMAC1 computes a MAC1 tag with a timestamp for replay protection.
-// MAC1 = HMAC-SHA256(sharedSecret, data || timestamp)[:16]
-func ComputeMAC1(sharedSecret []byte, data []byte, timestamp uint32) []byte {
+// ComputeMAC1 computes a MAC1 tag with a timestamp and nonce for replay protection.
+// MAC1 = HMAC-SHA256(sharedSecret, data || timestamp || nonce)[:16]
+func ComputeMAC1(sharedSecret []byte, data []byte, timestamp uint32, nonce []byte) []byte {
 	mac := hmac.New(sha256.New, sharedSecret)
 	mac.Write(data)
 	var ts [4]byte
 	binary.BigEndian.PutUint32(ts[:], timestamp)
 	mac.Write(ts[:])
+	mac.Write(nonce)
 	return mac.Sum(nil)[:MACSize]
 }
 
-// VerifyMAC1 checks a MAC1 tag against data, timestamp, and shared secret.
-func VerifyMAC1(sharedSecret []byte, data []byte, timestamp uint32, mac1 []byte) bool {
-	expected := ComputeMAC1(sharedSecret, data, timestamp)
+// VerifyMAC1 checks a MAC1 tag against data, timestamp, nonce, and shared secret.
+func VerifyMAC1(sharedSecret []byte, data []byte, timestamp uint32, nonce []byte, mac1 []byte) bool {
+	expected := ComputeMAC1(sharedSecret, data, timestamp, nonce)
 	return subtle.ConstantTimeCompare(mac1, expected) == 1
+}
+
+// GenerateNonce generates a cryptographically random 8-byte nonce.
+func GenerateNonce() ([]byte, error) {
+	nonce := make([]byte, NonceSize)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	return nonce, nil
 }
 
 // NowTimestamp returns the current time as a uint32 epoch seconds value.
