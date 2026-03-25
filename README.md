@@ -1,13 +1,31 @@
 # sQUIC — Shielded QUIC
 
-sQUIC is an extension of QUIC that adds four features:
+## Features
 
-1. **Silent server** — the server is invisible to port scanners. Only clients that possess the server's public key can elicit a response.
-2. **No CA/PKI** — identity is a pinned Ed25519 public key (32 bytes), not a certificate chain. No certificate authorities.
-3. **Client whitelisting** — optionally restrict connections to a set of known client public keys, manageable at runtime. Add, remove, and query keys without restarting the server. Non-whitelisted clients are silently dropped at the MAC layer — no handshake, no state, no response.
-4. **Replay protection** — a timestamp is included in the MAC computation. The server rejects Initial packets older than 120 seconds, preventing replay attacks. QUIC's own connection ID deduplication provides additional protection within the window.
+1. **Pre-handshake authentication** — clients must prove knowledge of the server's public key before the QUIC handshake begins. Invalid packets are silently discarded.
+2. **No CA/PKI** — identity is a pinned Ed25519 public key (32 bytes). No certificate authorities.
+3. **Client whitelisting** — runtime-manageable set of allowed client keys. Non-whitelisted clients are silently dropped at the MAC layer.
+4. **Persistent client identity** — optional `ClientKey` config for stable client identity across reconnects, enabling server-side whitelisting.
+5. **Replay protection** — 120-second timestamp window in the MAC computation.
+6. **Interoperable** — same wire format as squic-rust. Go server + Rust client (and vice versa) work together.
 
-Everything else is standard QUIC — streams, flow control, congestion control, connection migration, 0-RTT — all provided by quic-go with zero modifications.
+### Connection Modes
+
+| Mode | Server config | Client config | Behaviour |
+|------|--------------|---------------|-----------|
+| **Open** | No `AllowedKeys` | No `ClientKey` | Any client with the server's public key can connect. Default. |
+| **Whitelisted** | `AllowedKeys` set | `ClientKey` set | Only clients whose keys are in the whitelist can connect. Silently dropped before any QUIC processing. |
+| **Identified** | No `AllowedKeys` | `ClientKey` set | Any valid client can connect. Server can identify returning clients by their public key. |
+
+In all three modes, the server is silent to anyone who does not possess the server's public key.
+
+### Connection String
+
+A server's address and public key can be shared as a single string, for example:
+
+```
+sqc://example.com:443/EFj2YJzH6MwVfPnbLdR4SjrUkA9QpXhgK7CcTx31Wm5
+```
 
 ## Rationale
 
