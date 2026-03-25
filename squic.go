@@ -1,4 +1,4 @@
-// Package squic provides Sovereign QUIC — a silent-server wrapper around quic-go.
+// Package squic provides Shielded QUIC — a silent-server wrapper around quic-go.
 //
 // sQUIC adds two features on top of standard QUIC:
 //   - Silent server: the server is invisible to port scanners. Only clients

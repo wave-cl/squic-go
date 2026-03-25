@@ -1,4 +1,4 @@
-# sQUIC — Sovereign QUIC
+# sQUIC — Shielded QUIC
 
 sQUIC is an extension of QUIC that adds four features:
 
