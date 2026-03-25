@@ -15,7 +15,6 @@
 |------|--------------|---------------|-----------|
 | **Open** | No `AllowedKeys` | No `ClientKey` | Any client with the server's public key can connect. Default. |
 | **Whitelisted** | `AllowedKeys` set | `ClientKey` set | Only clients whose keys are in the whitelist can connect. Silently dropped before any QUIC processing. |
-| **Identified** | No `AllowedKeys` | `ClientKey` set | Any valid client can connect. Server can identify returning clients by their public key. |
 
 In all three modes, the server is silent to anyone who does not possess the server's public key.
 
