@@ -27,14 +27,6 @@ A server's address and public key can be shared as a single string, for example:
 sqc://example.com:443/EFj2YJzH6MwVfPnbLdR4SjrUkA9QpXhgK7CcTx31Wm5
 ```
 
-## Rationale
-
-Standard QUIC servers respond to every incoming packet, making them trivially discoverable by port scanners. TLS certificate chains leak server identity and depend on certificate authorities. There is no built-in mechanism to restrict which clients can even attempt a connection.
-
-sQUIC addresses this by borrowing ideas from WireGuard: the server is silent until a client proves knowledge of the server's public key via a DH-based MAC. No valid MAC, no response — the server is indistinguishable from a closed port. Identity is a single 32-byte key, not a certificate. Optional whitelisting lets the server restrict access to known clients at the MAC layer, before any QUIC state is allocated.
-
-The implementation wraps quic-go as an unmodified dependency rather than forking it. Upstream improvements — performance, security fixes, new RFCs — arrive via `go get -u`. The wrapper touches only the UDP socket layer, preserving quic-go's full fast path (GSO, sendmmsg/recvmmsg, ECN) with near-zero overhead.
-
 ## Install
 
 ```
