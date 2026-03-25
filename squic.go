@@ -87,6 +87,11 @@ type Config struct {
 	// The client's X25519 public key is derived from this for MAC1 and whitelist matching.
 	ClientKey string
 
+	// LoadThreshold is the DH operations per second before the server enters
+	// under-load mode and requires MAC2 (cookie proof-of-address).
+	// Default: 1000. Set to 0 to disable MAC2 protection.
+	LoadThreshold int64
+
 	// QuicConfig allows passing additional quic-go configuration.
 	// If nil, sensible defaults are used. Overrides all other fields.
 	QuicConfig *quic.Config
@@ -153,6 +158,13 @@ func (c *Config) allowedKeys() [][]byte {
 	return c.AllowedKeys
 }
 
+func (c *Config) loadThreshold() int64 {
+	if c == nil || c.LoadThreshold <= 0 {
+		return 1000
+	}
+	return c.LoadThreshold
+}
+
 func (c *Config) nextProtos() []string {
 	if c != nil && len(c.NextProtos) > 0 {
 		return c.NextProtos
@@ -190,7 +202,7 @@ func Listen(network, addr string, serverCert tls.Certificate, serverPubKey []byt
 	serverX25519Priv := Ed25519PrivateToX25519(edPriv)
 
 	// Wrap with DH MAC1 validation — silent server
-	wrappedConn := newServerConn(rawConn, serverX25519Priv, config.allowedKeys())
+	wrappedConn := newServerConn(rawConn, serverX25519Priv, config.allowedKeys(), config.loadThreshold())
 
 	tlsConf := ServerTLSConfig(serverCert)
 	if protos := config.nextProtos(); protos != nil {

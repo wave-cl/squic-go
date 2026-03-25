@@ -1,6 +1,7 @@
 package squic
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"net"
 	"sync"
@@ -31,6 +32,7 @@ type clientConn struct {
 	sharedSecret []byte // X25519(clientPriv, serverPub)
 	clientPubKey []byte // 32-byte X25519 public key
 	initialSent  atomic.Bool
+	cookie       atomic.Value // stores []byte cookie from server (for MAC2)
 }
 
 func newClientConn(conn *net.UDPConn, sharedSecret, clientX25519Pub []byte) *clientConn {
@@ -44,7 +46,18 @@ func newClientConn(conn *net.UDPConn, sharedSecret, clientX25519Pub []byte) *cli
 // --- net.PacketConn methods (delegate to underlying UDPConn) ---
 
 func (c *clientConn) ReadFrom(b []byte) (int, net.Addr, error) {
-	return c.conn.ReadFrom(b)
+	for {
+		n, addr, err := c.conn.ReadFrom(b)
+		if err != nil {
+			return n, addr, err
+		}
+		// Check if this is a cookie reply
+		if n > 0 && b[0] == CookieReplyType {
+			c.cookie.Store(append([]byte(nil), b[1:n]...))
+			continue // read next packet
+		}
+		return n, addr, nil
+	}
 }
 
 func (c *clientConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
@@ -72,7 +85,17 @@ func (c *clientConn) SetReadBuffer(bytes int) error          { return c.conn.Set
 func (c *clientConn) SetWriteBuffer(bytes int) error         { return c.conn.SetWriteBuffer(bytes) }
 
 func (c *clientConn) ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UDPAddr, err error) {
-	return c.conn.ReadMsgUDP(b, oob)
+	for {
+		n, oobn, flags, addr, err = c.conn.ReadMsgUDP(b, oob)
+		if err != nil {
+			return
+		}
+		if n > 0 && b[0] == CookieReplyType {
+			c.cookie.Store(append([]byte(nil), b[1:n]...))
+			continue
+		}
+		return
+	}
 }
 
 func (c *clientConn) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int, err error) {
@@ -82,15 +105,31 @@ func (c *clientConn) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int,
 	return c.conn.WriteMsgUDP(b, oob, addr)
 }
 
-// writeInitial appends client pubkey + timestamp + MAC1 to an Initial packet (WriteTo path).
-func (c *clientConn) writeInitial(p []byte, addr *net.UDPAddr) (int, error) {
+// buildInitial constructs the Initial packet with MAC1 + MAC2 appended.
+func (c *clientConn) buildInitial(p []byte) []byte {
 	ts := NowTimestamp()
-	mac := ComputeMAC1(c.sharedSecret, p, ts)
+	mac1 := ComputeMAC1(c.sharedSecret, p, ts)
+
 	buf := make([]byte, len(p)+MACOverhead)
 	copy(buf, p)
 	copy(buf[len(p):], c.clientPubKey)
 	binary.BigEndian.PutUint32(buf[len(p)+ClientKeySize:], ts)
-	copy(buf[len(p)+ClientKeySize+TimestampSize:], mac)
+	copy(buf[len(p)+ClientKeySize+TimestampSize:], mac1)
+
+	// MAC2: zeros if no cookie, computed if cookie available
+	mac2Start := len(p) + ClientKeySize + TimestampSize + MACSize
+	if cookie, ok := c.cookie.Load().([]byte); ok && len(cookie) > 0 {
+		mac2 := ComputeMAC2(cookie, buf[:mac2Start], mac1)
+		copy(buf[mac2Start:], mac2)
+	}
+	// else: MAC2 field is already zeros from make()
+
+	return buf
+}
+
+// writeInitial appends client pubkey + timestamp + MAC1 + MAC2 to an Initial packet (WriteTo path).
+func (c *clientConn) writeInitial(p []byte, addr *net.UDPAddr) (int, error) {
+	buf := c.buildInitial(p)
 	n, err := c.conn.WriteToUDP(buf, addr)
 	if err == nil {
 		n = len(p)
@@ -98,15 +137,9 @@ func (c *clientConn) writeInitial(p []byte, addr *net.UDPAddr) (int, error) {
 	return n, err
 }
 
-// writeInitialMsg appends client pubkey + timestamp + MAC1 to an Initial packet (WriteMsgUDP path).
+// writeInitialMsg appends client pubkey + timestamp + MAC1 + MAC2 to an Initial packet (WriteMsgUDP path).
 func (c *clientConn) writeInitialMsg(b, oob []byte, addr *net.UDPAddr) (int, int, error) {
-	ts := NowTimestamp()
-	mac := ComputeMAC1(c.sharedSecret, b, ts)
-	buf := make([]byte, len(b)+MACOverhead)
-	copy(buf, b)
-	copy(buf[len(b):], c.clientPubKey)
-	binary.BigEndian.PutUint32(buf[len(b)+ClientKeySize:], ts)
-	copy(buf[len(b)+ClientKeySize+TimestampSize:], mac)
+	buf := c.buildInitial(b)
 	n, oobn, err := c.conn.WriteMsgUDP(buf, oob, addr)
 	if err == nil {
 		n = len(b)
@@ -124,13 +157,29 @@ type serverConn struct {
 	keysMu           sync.RWMutex      // protects allowedKeys
 	allowedKeys      map[[32]byte]bool  // optional whitelist of client X25519 public keys
 	batchReader      *ipv4.PacketConn   // lazy-initialized for ReadBatch
+
+	// MAC2 + cookie DDoS protection
+	cookieSecret     [32]byte          // current cookie encryption secret
+	prevCookieSecret [32]byte          // previous secret (for rotation grace period)
+	underLoad        atomic.Bool       // true when DH rate exceeds threshold
+	dhCount          atomic.Int64      // DH operations in current second
+	loadThreshold    int64             // DH/sec before entering under-load mode
 }
 
-func newServerConn(conn *net.UDPConn, serverX25519Priv []byte, allowedKeys [][]byte) *serverConn {
+func newServerConn(conn *net.UDPConn, serverX25519Priv []byte, allowedKeys [][]byte, loadThreshold int64) *serverConn {
 	sc := &serverConn{
 		conn:             conn,
 		serverX25519Priv: serverX25519Priv,
+		loadThreshold:    loadThreshold,
 	}
+
+	if sc.loadThreshold <= 0 {
+		sc.loadThreshold = 1000 // default: 1000 DH ops/sec
+	}
+
+	// Initialize cookie secrets
+	rand.Read(sc.cookieSecret[:])
+	rand.Read(sc.prevCookieSecret[:])
 
 	if len(allowedKeys) > 0 {
 		sc.allowedKeys = make(map[[32]byte]bool, len(allowedKeys))
@@ -143,7 +192,49 @@ func newServerConn(conn *net.UDPConn, serverX25519Priv []byte, allowedKeys [][]b
 		}
 	}
 
+	// Start background goroutines
+	go sc.rotateCookieSecrets()
+	go sc.monitorLoad()
+
 	return sc
+}
+
+// rotateCookieSecrets rotates the cookie encryption secret every 120 seconds.
+func (c *serverConn) rotateCookieSecrets() {
+	ticker := time.NewTicker(120 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		c.prevCookieSecret = c.cookieSecret
+		rand.Read(c.cookieSecret[:])
+	}
+}
+
+// monitorLoad tracks DH operations per second and toggles underLoad.
+func (c *serverConn) monitorLoad() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		count := c.dhCount.Swap(0)
+		if count > c.loadThreshold {
+			c.underLoad.Store(true)
+		} else {
+			c.underLoad.Store(false)
+		}
+	}
+}
+
+// sendCookieReply sends an encrypted cookie to the client.
+// The cookie is deterministic for (secret, IP), encrypted for transport.
+func (c *serverConn) sendCookieReply(addr *net.UDPAddr) {
+	cookie := CookieValue(c.cookieSecret, addr.IP)
+	encrypted, err := EncryptCookie(c.cookieSecret, cookie)
+	if err != nil {
+		return
+	}
+	reply := make([]byte, 1+len(encrypted))
+	reply[0] = CookieReplyType
+	copy(reply[1:], encrypted)
+	c.conn.WriteToUDP(reply, addr)
 }
 
 // --- net.PacketConn methods ---
@@ -154,10 +245,10 @@ func (c *serverConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 		if err != nil {
 			return
 		}
-		if ok, stripped := c.validateAndStrip(p, n); ok {
+		udpAddr, _ := addr.(*net.UDPAddr)
+		if ok, stripped := c.validateAndStrip(p, n, udpAddr); ok {
 			return stripped, addr, nil
 		}
-		// invalid — silently drop, read next
 	}
 }
 
@@ -188,10 +279,9 @@ func (c *serverConn) ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UD
 		if err != nil {
 			return
 		}
-		if ok, stripped := c.validateAndStrip(b, n); ok {
+		if ok, stripped := c.validateAndStrip(b, n, addr); ok {
 			return stripped, oobn, flags, addr, nil
 		}
-		// invalid — silently drop, read next
 	}
 }
 
@@ -218,7 +308,11 @@ func (c *serverConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	valid := 0
 	for i := 0; i < n; i++ {
 		data := ms[i].Buffers[0][:ms[i].N]
-		if ok, stripped := c.validateAndStrip(data, ms[i].N); ok {
+		var addr *net.UDPAddr
+		if ms[i].Addr != nil {
+			addr, _ = ms[i].Addr.(*net.UDPAddr)
+		}
+		if ok, stripped := c.validateAndStrip(data, ms[i].N, addr); ok {
 			if valid != i {
 				ms[valid] = ms[i]
 			}
@@ -237,13 +331,14 @@ func (c *serverConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 
 // validateAndStrip checks if the packet is valid and strips MAC overhead from Initial packets.
 // Returns (true, newLength) if valid, (false, 0) if should be dropped.
-func (c *serverConn) validateAndStrip(p []byte, n int) (bool, int) {
+// addr is used to send cookie replies when under load (can be nil to skip).
+func (c *serverConn) validateAndStrip(p []byte, n int, addr *net.UDPAddr) (bool, int) {
 	// Non-Initial packets pass through unmodified
 	if !isQUICInitial(p[:n]) {
 		return true, n
 	}
 
-	// Initial packet: must have client pubkey + MAC1 appended
+	// Initial packet: must have client pubkey + MAC1 + MAC2 appended
 	if n <= MACOverhead {
 		return false, 0
 	}
@@ -251,15 +346,52 @@ func (c *serverConn) validateAndStrip(p []byte, n int) (bool, int) {
 	quicLen := n - MACOverhead
 	clientPub := p[quicLen : quicLen+ClientKeySize]
 	tsBytes := p[quicLen+ClientKeySize : quicLen+ClientKeySize+TimestampSize]
-	mac1 := p[quicLen+ClientKeySize+TimestampSize : n]
+	mac1Start := quicLen + ClientKeySize + TimestampSize
+	mac1 := p[mac1Start : mac1Start+MACSize]
+	mac2 := p[mac1Start+MACSize : n]
 	timestamp := binary.BigEndian.Uint32(tsBytes)
 
-	// Step 1: Replay protection — reject timestamps outside window
+	// Step 1: Replay protection — reject timestamps outside window (cheap)
 	if !TimestampInWindow(timestamp, NowTimestamp()) {
 		return false, 0
 	}
 
-	// Step 2: Whitelist check (fast map lookup, before expensive DH)
+	// Step 2: MAC2 check — if under load, require valid MAC2
+	if c.underLoad.Load() {
+		isZero := true
+		for _, b := range mac2 {
+			if b != 0 {
+				isZero = false
+				break
+			}
+		}
+
+		mac2Valid := false
+		if !isZero && addr != nil {
+			// Recompute deterministic cookie for this IP, verify MAC2
+			// Try current secret, then previous (for rotation grace)
+			dataBeforeMAC2 := p[:mac1Start]
+			cookie := CookieValue(c.cookieSecret, addr.IP)
+			if VerifyMAC2(cookie, dataBeforeMAC2, mac1, mac2) {
+				mac2Valid = true
+			} else {
+				cookie = CookieValue(c.prevCookieSecret, addr.IP)
+				if VerifyMAC2(cookie, dataBeforeMAC2, mac1, mac2) {
+					mac2Valid = true
+				}
+			}
+		}
+
+		if !mac2Valid {
+			// Under load with no valid MAC2 — send cookie reply and drop
+			if addr != nil {
+				c.sendCookieReply(addr)
+			}
+			return false, 0
+		}
+	}
+
+	// Step 3: Whitelist check (fast map lookup, before expensive DH)
 	c.keysMu.RLock()
 	keys := c.allowedKeys
 	c.keysMu.RUnlock()
@@ -271,7 +403,8 @@ func (c *serverConn) validateAndStrip(p []byte, n int) (bool, int) {
 		}
 	}
 
-	// Step 3: DH + MAC1 verification (includes timestamp in MAC input)
+	// Step 4: DH + MAC1 verification (expensive)
+	c.dhCount.Add(1)
 	shared, dhErr := X25519(c.serverX25519Priv, clientPub)
 	if dhErr != nil {
 		return false, 0
@@ -283,6 +416,7 @@ func (c *serverConn) validateAndStrip(p []byte, n int) (bool, int) {
 
 	return true, quicLen
 }
+
 
 // addKey adds a client public key to the whitelist.
 // Initializes the map if it was nil (implicitly enables whitelisting).
