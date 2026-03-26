@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -203,7 +202,9 @@ func runUpload(conn *quic.Conn, dur time.Duration) error {
 	}
 
 	// Signal upload mode
-	stream.Write([]byte("U"))
+	if _, err := stream.Write([]byte("U")); err != nil {
+		return err
+	}
 
 	var totalBytes atomic.Int64
 	buf := make([]byte, 32*1024)
@@ -263,7 +264,9 @@ func runDownload(conn *quic.Conn, dur time.Duration) error {
 	}
 
 	// Signal download mode
-	stream.Write([]byte("D"))
+	if _, err := stream.Write([]byte("D")); err != nil {
+		return err
+	}
 
 	var totalBytes atomic.Int64
 	buf := make([]byte, 32*1024)
@@ -280,7 +283,7 @@ func runDownload(conn *quic.Conn, dur time.Duration) error {
 			delta := total - lastTotal
 			lastTotal = total
 			mbps := float64(delta) * 8 / 1e6
-			fmt.Printf("[  0]  %.0f-%.0fs  %d MB  %.1f Mbits/sec\n",
+			fmt.Printf("[  0]  %.0f-%.0fs  %d MB  %.1f Mbits/sec  recv\n",
 				elapsed.Seconds()-1, elapsed.Seconds(),
 				delta/(1<<20), mbps)
 		}
@@ -318,7 +321,10 @@ func runBidir(conn *quic.Conn, dur time.Duration) error {
 			fmt.Fprintf(os.Stderr, "upload stream: %v\n", err)
 			return
 		}
-		stream.Write([]byte("U"))
+		if _, err := stream.Write([]byte("U")); err != nil {
+			fmt.Fprintf(os.Stderr, "upload mode write: %v\n", err)
+			return
+		}
 
 		var total int64
 		buf := make([]byte, 32*1024)
@@ -344,7 +350,10 @@ func runBidir(conn *quic.Conn, dur time.Duration) error {
 			fmt.Fprintf(os.Stderr, "download stream: %v\n", err)
 			return
 		}
-		stream.Write([]byte("D"))
+		if _, err := stream.Write([]byte("D")); err != nil {
+			fmt.Fprintf(os.Stderr, "download mode write: %v\n", err)
+			return
+		}
 
 		var total int64
 		buf := make([]byte, 32*1024)
@@ -366,5 +375,3 @@ func runBidir(conn *quic.Conn, dur time.Duration) error {
 	return nil
 }
 
-// Silence unused import
-var _ tls.Config
