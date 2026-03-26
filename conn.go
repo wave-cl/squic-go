@@ -28,11 +28,12 @@ func isQUICInitial(data []byte) bool {
 // It appends the client's X25519 public key and a DH-based MAC1 to outgoing Initial packets.
 // Implements OOBCapablePacketConn so quic-go uses the fast path (recvmmsg, sendmmsg, GSO, ECN).
 type clientConn struct {
-	conn         *net.UDPConn
-	sharedSecret []byte // X25519(clientPriv, serverPub)
-	clientPubKey []byte // 32-byte X25519 public key
-	initialSent  atomic.Bool
-	cookie       atomic.Value // stores []byte cookie from server (for MAC2)
+	conn           *net.UDPConn
+	sharedSecret   []byte // X25519(clientPriv, serverPub)
+	clientPubKey   []byte // 32-byte X25519 public key
+	initialSent    atomic.Bool
+	handshakeDone  atomic.Bool  // true after first non-cookie packet; skips all checks
+	cookie         atomic.Value // stores []byte cookie from server (for MAC2)
 }
 
 func newClientConn(conn *net.UDPConn, sharedSecret, clientX25519Pub []byte) *clientConn {
@@ -51,16 +52,23 @@ func (c *clientConn) ReadFrom(b []byte) (int, net.Addr, error) {
 		if err != nil {
 			return n, addr, err
 		}
-		// Check if this is a cookie reply
+		// Fast path: after handshake, no cookie replies possible
+		if c.handshakeDone.Load() {
+			return n, addr, nil
+		}
 		if n > 0 && b[0] == CookieReplyType {
 			c.cookie.Store(append([]byte(nil), b[1:n]...))
-			continue // read next packet
+			continue
 		}
+		c.handshakeDone.Store(true)
 		return n, addr, nil
 	}
 }
 
 func (c *clientConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	if c.handshakeDone.Load() {
+		return c.conn.WriteTo(p, addr)
+	}
 	if !c.initialSent.Load() && isQUICInitial(p) {
 		return c.writeInitial(p, addr.(*net.UDPAddr))
 	}
@@ -90,15 +98,23 @@ func (c *clientConn) ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UD
 		if err != nil {
 			return
 		}
+		// Fast path: after handshake, no cookie replies possible
+		if c.handshakeDone.Load() {
+			return
+		}
 		if n > 0 && b[0] == CookieReplyType {
 			c.cookie.Store(append([]byte(nil), b[1:n]...))
 			continue
 		}
+		c.handshakeDone.Store(true)
 		return
 	}
 }
 
 func (c *clientConn) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int, err error) {
+	if c.handshakeDone.Load() {
+		return c.conn.WriteMsgUDP(b, oob, addr)
+	}
 	if !c.initialSent.Load() && isQUICInitial(b) {
 		return c.writeInitialMsg(b, oob, addr)
 	}
