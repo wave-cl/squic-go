@@ -35,6 +35,16 @@ type clientConn struct {
 	cookieKey     [32]byte         // decrypts cookie replies; derived from the server's public key
 	handshakeDone atomic.Bool      // true after first non-cookie packet; skips the cookie scan
 	cookie        atomic.Value     // decrypted 16-byte cookie from the server, keys MAC2
+	// The most recent Initial datagram and where it went, so a cookie
+	// challenge can be answered immediately rather than at the next PTO.
+	lastInitial atomic.Value // holds sentInitial
+}
+
+// sentInitial is the last Initial datagram written, kept so a cookie challenge
+// can be answered without waiting for a retransmission timer.
+type sentInitial struct {
+	datagram []byte
+	addr     *net.UDPAddr
 }
 
 func newClientConn(conn *net.UDPConn, sharedSecret, clientX25519Pub []byte, cookieKey [32]byte) *clientConn {
@@ -57,7 +67,32 @@ func (c *clientConn) storeCookie(payload []byte) bool {
 		return false
 	}
 	c.cookie.Store(plain)
+	c.answerChallenge()
 	return true
+}
+
+// answerChallenge re-sends the last Initial straight away, now carrying MAC2.
+//
+// quic-go never sees a cookie reply — the read paths strip them out — so left
+// to itself it would not retransmit until its next PTO. The challenge is
+// answerable at once and waiting costs the caller a whole round of backoff, so
+// answer it here. WireGuard does the same, and squic-rust matches.
+//
+// Replaying the datagram is sound: the server dropped the original at the MAC2
+// gate before quic-go saw it, so this is the first time that packet number
+// reaches the peer; where it did get through, the duplicate is discarded. Only
+// the sQUIC envelope is rebuilt, never the QUIC packet inside it.
+func (c *clientConn) answerChallenge() {
+	last, ok := c.lastInitial.Load().(sentInitial)
+	if !ok || last.addr == nil {
+		return // nothing sent yet; the next Initial will carry the cookie
+	}
+	c.conn.WriteToUDP(c.buildInitial(last.datagram), last.addr)
+}
+
+// rememberInitial keeps a copy of the datagram just sent, for answerChallenge.
+func (c *clientConn) rememberInitial(p []byte, addr *net.UDPAddr) {
+	c.lastInitial.Store(sentInitial{datagram: append([]byte(nil), p...), addr: addr})
 }
 
 // --- net.PacketConn methods (delegate to underlying UDPConn) ---
@@ -220,6 +255,7 @@ func (c *clientConn) buildInitial(p []byte) []byte {
 
 // writeInitial appends client pubkey + timestamp + MAC1 + MAC2 to an Initial packet (WriteTo path).
 func (c *clientConn) writeInitial(p []byte, addr *net.UDPAddr) (int, error) {
+	c.rememberInitial(p, addr)
 	buf := c.buildInitial(p)
 	n, err := c.conn.WriteToUDP(buf, addr)
 	if err == nil {
@@ -230,6 +266,7 @@ func (c *clientConn) writeInitial(p []byte, addr *net.UDPAddr) (int, error) {
 
 // writeInitialMsg appends client pubkey + timestamp + MAC1 + MAC2 to an Initial packet (WriteMsgUDP path).
 func (c *clientConn) writeInitialMsg(b, oob []byte, addr *net.UDPAddr) (int, int, error) {
+	c.rememberInitial(b, addr)
 	buf := c.buildInitial(b)
 	n, oobn, err := c.conn.WriteMsgUDP(buf, oob, addr)
 	if err == nil {

@@ -780,9 +780,9 @@ func TestCookieChallengeAdmitsALegitimateClient(t *testing.T) {
 	}
 	defer ln.Close()
 
-	// Under load before the first packet arrives. The load monitor re-evaluates
-	// once a second, so the client's retransmission — the packet that actually
-	// carries MAC2 — has to get there inside that window.
+	// Under load before the first packet arrives. The client answers the
+	// challenge as soon as it lands rather than waiting for a retransmission
+	// timer, so this completes in about a round trip.
 	ln.SetUnderLoad(true)
 
 	go func() {
@@ -799,11 +799,21 @@ func TestCookieChallengeAdmitsALegitimateClient(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
+	started := time.Now()
 	conn, err := squic.Dial(ctx, ln.Addr().String(), pubKey, nil)
 	if err != nil {
 		t.Fatalf("cookie challenge locked out a legitimate client: %v", err)
 	}
+	elapsed := time.Since(started)
 	conn.CloseWithError(0, "")
+
+	// A coarse guard only: quic-go's own PTO is short enough that it would also
+	// come in under this bound, so passing here does not prove the challenge was
+	// answered on receipt. TestAnswerChallengeRetransmitsImmediately covers the
+	// mechanism directly.
+	if elapsed > 300*time.Millisecond {
+		t.Fatalf("cookie exchange took %v; expected roughly one RTT, so the challenge is being answered by a timer rather than on receipt", elapsed)
+	}
 
 	stats := ln.LoadStats()
 	if stats.CookieRepliesSent < 1 {
