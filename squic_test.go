@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -330,41 +332,74 @@ func TestWhitelistAllowsKnownClient(t *testing.T) {
 		t.Fatalf("GenerateKeyPair: %v", err)
 	}
 
-	// The client generates an ephemeral X25519 key pair on each Dial().
-	// To whitelist it, we'd need to know the key in advance.
-	// For this test: we connect WITHOUT a whitelist (AllowedKeys: nil)
-	// and verify it works. The whitelisting test below uses a controlled setup.
-	ln, err := squic.Listen("udp", "127.0.0.1:0", serverCert, serverPub, &squic.Config{
-		AllowedKeys: nil, // no whitelist = accept any valid MAC1
-	})
+	// A client with a stable identity, so its key can be whitelisted before it
+	// ever connects. Without ClientKey the client mints an ephemeral X25519
+	// pair per Dial, which is why this test used to settle for connecting with
+	// no whitelist at all and never checked the thing its name describes.
+	clientSeed := make([]byte, ed25519.SeedSize)
+	if _, err := rand.Read(clientSeed); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	clientEd := ed25519.NewKeyFromSeed(clientSeed)
+	clientKey, err := squic.Ed25519PublicToX25519(clientEd.Public().(ed25519.PublicKey))
+	if err != nil {
+		t.Fatalf("Ed25519PublicToX25519: %v", err)
+	}
+
+	ln, err := squic.Listen("udp", "127.0.0.1:0", serverCert, serverPub, nil)
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
 	defer ln.Close()
+	ln.EnableWhitelist(clientKey)
 
 	serverAddr := ln.Addr().String()
 
+	// Report why the accept gave up rather than swallowing the error, so a
+	// failure names the cause instead of only the symptom.
+	accepted := make(chan error, 1)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		conn, err := ln.Accept(ctx)
 		if err != nil {
+			accepted <- err
 			return
 		}
-		stream, _ := conn.AcceptStream(ctx)
-		if stream != nil {
-			io.Copy(io.Discard, stream)
-		}
+		conn.CloseWithError(0, "")
+		accepted <- nil
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
-	conn, err := squic.Dial(ctx, serverAddr, serverPub, nil)
+	conn, err := squic.Dial(ctx, serverAddr, serverPub, &squic.Config{
+		ClientKey: hex.EncodeToString(clientSeed),
+	})
 	if err != nil {
-		t.Fatalf("Dial with no whitelist should succeed: %v", err)
+		t.Fatalf("whitelisted client should be admitted: %v", err)
 	}
-	conn.CloseWithError(0, "")
+	// Hold the connection open until the server has accepted it. Closing
+	// straight after Dial races the server: a connection the client has
+	// already torn down is discarded before it ever reaches Accept.
+	defer conn.CloseWithError(0, "")
+
+	select {
+	case err := <-accepted:
+		if err != nil {
+			t.Fatalf("server did not accept the whitelisted client: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not accept the whitelisted client: Accept never returned")
+	}
+
+	// The other half of the claim: admitting this client has to mean the
+	// whitelist is enforced, not that the server is letting everyone in. An
+	// ephemeral client is not on the list and must be dropped in silence.
+	strangerCtx, strangerCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer strangerCancel()
+	if _, err := squic.Dial(strangerCtx, serverAddr, serverPub, nil); err == nil {
+		t.Fatal("a client absent from the whitelist was admitted")
+	}
 }
 
 func TestWhitelistRejectsUnknownClient(t *testing.T) {
