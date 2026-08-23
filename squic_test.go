@@ -491,17 +491,20 @@ func TestRuntimeAllowKey(t *testing.T) {
 	// Now disable whitelist — should allow any valid MAC1 client
 	ln.DisableWhitelist()
 
-	// Accept goroutine
-	accepted := make(chan struct{})
+	// Accept goroutine. It reports why it gave up rather than swallowing the
+	// error, so a failure here says what went wrong instead of only that
+	// nothing arrived.
+	accepted := make(chan error, 1)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		conn, err := ln.Accept(ctx)
 		if err != nil {
+			accepted <- err
 			return
 		}
 		conn.CloseWithError(0, "")
-		close(accepted)
+		accepted <- nil
 	}()
 
 	// Attempt 2: should succeed
@@ -511,12 +514,19 @@ func TestRuntimeAllowKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial after DisableWhitelist should succeed: %v", err)
 	}
-	conn.CloseWithError(0, "")
+	// Hold the connection open until the server has accepted it. Closing
+	// straight after Dial races the server: a connection the client has
+	// already torn down is discarded before it ever reaches Accept, and the
+	// test then reports a whitelist failure for a teardown it caused itself.
+	defer conn.CloseWithError(0, "")
 
 	select {
-	case <-accepted:
+	case err := <-accepted:
+		if err != nil {
+			t.Fatalf("server did not accept connection: %v", err)
+		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("server did not accept connection")
+		t.Fatal("server did not accept connection: Accept never returned")
 	}
 }
 
