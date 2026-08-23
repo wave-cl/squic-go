@@ -88,8 +88,13 @@ type Config struct {
 	ClientKey string
 
 	// LoadThreshold is the DH operations per second before the server enters
-	// under-load mode and requires MAC2 (cookie proof-of-address).
-	// Default: 1000. Set to 0 to disable MAC2 protection.
+	// under-load mode and starts requiring a cookie (MAC2) from callers it has
+	// not challenged yet.
+	//
+	// Zero means unset and selects the default of 1000, because Go cannot tell
+	// a field left out of a struct literal from one explicitly set to zero. To
+	// turn the cookie defence off, pass a negative value. (squic-rust spells
+	// the same two states Option::None and Some(0), which it can distinguish.)
 	LoadThreshold int64
 
 	// QuicConfig allows passing additional quic-go configuration.
@@ -159,8 +164,11 @@ func (c *Config) allowedKeys() [][]byte {
 }
 
 func (c *Config) loadThreshold() int64 {
-	if c == nil || c.LoadThreshold <= 0 {
-		return 1000
+	if c == nil || c.LoadThreshold == 0 {
+		return 1000 // unset
+	}
+	if c.LoadThreshold < 0 {
+		return 0 // caller is disabling the cookie defence
 	}
 	return c.LoadThreshold
 }
