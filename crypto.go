@@ -46,3 +46,12 @@ func Ed25519PrivateToX25519(edPriv ed25519.PrivateKey) []byte {
 func X25519(scalar, point []byte) ([]byte, error) {
 	return curve25519.X25519(scalar, point)
 }
+
+// x25519Public derives the X25519 public key for a private key.
+func x25519Public(priv []byte) []byte {
+	pub, err := curve25519.X25519(priv, curve25519.Basepoint)
+	if err != nil {
+		return make([]byte, 32)
+	}
+	return pub
+}

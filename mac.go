@@ -105,6 +105,30 @@ func CookieValue(secret [32]byte, clientIP net.IP) []byte {
 	return mac.Sum(nil)[:16]
 }
 
+// cookieKeyLabel is the domain separator for the cookie-reply encryption key.
+var cookieKeyLabel = []byte("squic-cookie-v1")
+
+// CookieKey derives the key that encrypts cookie replies, from the server's
+// X25519 public key.
+//
+// Both ends can compute this without a Diffie-Hellman: the server holds the
+// matching private key, and any legitimate client already knows the server's
+// public key — that is the premise of a silent server. Keying it off the DH
+// shared secret instead would defeat the purpose, since the cookie exists
+// precisely so the server does not have to do a DH for an unverified caller.
+//
+// An attacker who does not hold the server's public key cannot read the
+// cookie, and one who does could already make the server do DH work, so
+// nothing is given away.
+func CookieKey(serverX25519Pub []byte) [32]byte {
+	h := sha256.New()
+	h.Write(cookieKeyLabel)
+	h.Write(serverX25519Pub)
+	var key [32]byte
+	copy(key[:], h.Sum(nil))
+	return key
+}
+
 // EncryptCookie encrypts a cookie value for sending to the client.
 // Returns [nonce(24)] [ciphertext(cookie + 16 byte tag)].
 func EncryptCookie(secret [32]byte, cookie []byte) ([]byte, error) {

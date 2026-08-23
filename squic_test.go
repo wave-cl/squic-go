@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -611,5 +612,159 @@ func TestEnableWhitelistWithKeys(t *testing.T) {
 	ln.DisableWhitelist()
 	if keys := ln.AllowedKeys(); keys != nil {
 		t.Fatal("AllowedKeys should be nil after DisableWhitelist")
+	}
+}
+
+// lossyRelay forwards UDP between a client and server, blackholing the first
+// dropFirst datagrams travelling client -> server. Returns the address the
+// client should dial.
+func lossyRelay(t *testing.T, server string, dropFirst int) string {
+	t.Helper()
+	serverAddr, err := net.ResolveUDPAddr("udp", server)
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr: %v", err)
+	}
+	front, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("front ListenUDP: %v", err)
+	}
+	back, err := net.DialUDP("udp", nil, serverAddr)
+	if err != nil {
+		t.Fatalf("back DialUDP: %v", err)
+	}
+	t.Cleanup(func() { front.Close(); back.Close() })
+
+	var mu sync.Mutex
+	var client *net.UDPAddr
+
+	go func() {
+		buf := make([]byte, 65536)
+		dropped := 0
+		for {
+			n, from, err := front.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			client = from
+			mu.Unlock()
+			if dropped < dropFirst {
+				dropped++
+				continue
+			}
+			back.Write(buf[:n])
+		}
+	}()
+	go func() {
+		buf := make([]byte, 65536)
+		for {
+			n, err := back.Read(buf)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			to := client
+			mu.Unlock()
+			if to != nil {
+				front.WriteToUDP(buf[:n], to)
+			}
+		}
+	}()
+
+	return front.LocalAddr().String()
+}
+
+func assertHandshakeSurvivesLosing(t *testing.T, lost int) {
+	t.Helper()
+	cert, pubKey, err := squic.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+	ln, err := squic.Listen("udp", "127.0.0.1:0", cert, pubKey, nil)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		for {
+			conn, err := ln.Accept(ctx)
+			if err != nil {
+				return
+			}
+			_ = conn
+		}
+	}()
+
+	// Blackhole the client's first datagrams. QUIC must retransmit the
+	// Initial, and every retransmission has to carry a valid MAC or the silent
+	// server drops it too.
+	relay := lossyRelay(t, ln.Addr().String(), lost)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	started := time.Now()
+	conn, err := squic.Dial(ctx, relay, pubKey, nil)
+	if err != nil {
+		t.Fatalf("handshake failed after losing %d Initial(s) in %v: %v", lost, time.Since(started), err)
+	}
+	conn.CloseWithError(0, "")
+}
+
+func TestHandshakeSurvivesInitialPacketLoss(t *testing.T) {
+	assertHandshakeSurvivesLosing(t, 1)
+}
+
+// Several PTOs deep, the envelope must still be there.
+func TestHandshakeSurvivesRepeatedInitialLoss(t *testing.T) {
+	assertHandshakeSurvivesLosing(t, 3)
+}
+
+// The cookie defence has to admit legitimate clients, not just reject
+// attackers: challenge, decrypt, retransmit carrying MAC2, accept.
+func TestCookieChallengeAdmitsALegitimateClient(t *testing.T) {
+	cert, pubKey, err := squic.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+	ln, err := squic.Listen("udp", "127.0.0.1:0", cert, pubKey, nil)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+
+	// Under load before the first packet arrives. The load monitor re-evaluates
+	// once a second, so the client's retransmission — the packet that actually
+	// carries MAC2 — has to get there inside that window.
+	ln.SetUnderLoad(true)
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		for {
+			conn, err := ln.Accept(ctx)
+			if err != nil {
+				return
+			}
+			_ = conn
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	conn, err := squic.Dial(ctx, ln.Addr().String(), pubKey, nil)
+	if err != nil {
+		t.Fatalf("cookie challenge locked out a legitimate client: %v", err)
+	}
+	conn.CloseWithError(0, "")
+
+	stats := ln.LoadStats()
+	if stats.CookieRepliesSent < 1 {
+		t.Fatalf("server never issued a challenge: %+v", stats)
+	}
+	if stats.MAC2Verified < 1 {
+		t.Fatalf("client's MAC2 never verified — the exchange did not complete: %+v", stats)
 	}
 }

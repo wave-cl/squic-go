@@ -115,8 +115,8 @@ func (c *Config) quicConfig() *quic.Config {
 
 	qc := &quic.Config{
 		MaxIdleTimeout:                 timeout,
-		MaxIncomingStreams:              maxStreams,
-		MaxIncomingUniStreams:           maxStreams,
+		MaxIncomingStreams:             maxStreams,
+		MaxIncomingUniStreams:          maxStreams,
 		InitialStreamReceiveWindow:     1 << 20,  // 1MB
 		InitialConnectionReceiveWindow: 10 << 20, // 10MB
 	}
@@ -270,6 +270,31 @@ func (sl *ServerListener) AllowedKeys() [][]byte {
 	return result
 }
 
+// LoadStats is a snapshot of the server's cookie-based DDoS defence.
+//
+// Worth watching: UnderLoad means the server has stopped doing Diffie-Hellman
+// for callers that have not echoed back a cookie, which costs every new client
+// an extra round trip.
+type LoadStats struct {
+	// UnderLoad reports whether the server is currently demanding a valid MAC2.
+	UnderLoad bool
+	// CookieRepliesSent counts challenges issued since start.
+	CookieRepliesSent int64
+	// MAC2Verified counts Initial packets admitted on a valid MAC2.
+	MAC2Verified int64
+}
+
+// LoadStats returns a snapshot of the cookie defence's state.
+func (sl *ServerListener) LoadStats() LoadStats {
+	return sl.sc.loadStats()
+}
+
+// SetUnderLoad forces the under-load state. Exposed for tests, which would
+// otherwise have to win a race with the one-second load monitor.
+func (sl *ServerListener) SetUnderLoad(value bool) {
+	sl.sc.underLoad.Store(value)
+}
+
 // EnableWhitelist activates the client key whitelist, optionally pre-populated with keys.
 // Once enabled, only clients whose X25519 public keys are in the whitelist can connect.
 // If no keys are provided, the whitelist starts empty (blocks all new connections).
@@ -354,7 +379,7 @@ func Dial(ctx context.Context, addr string, serverPubKey []byte, config *Config)
 	}
 
 	// Wrap with DH MAC1 appending
-	wrappedConn := newClientConn(rawConn, shared, clientPub)
+	wrappedConn := newClientConn(rawConn, shared, clientPub, CookieKey(serverX25519Pub))
 
 	tlsConf := ClientTLSConfig(serverPubKey)
 	if protos := config.nextProtos(); protos != nil {
