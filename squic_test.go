@@ -864,3 +864,77 @@ func TestSmallOrderClientKeyIsRefused(t *testing.T) {
 	}
 	_ = mac1
 }
+
+func TestPeerKeyMatchesDialingClient(t *testing.T) {
+	cert, pubKey, err := squic.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+
+	// A client with a persistent identity: its X25519 transport key is derived
+	// from an Ed25519 seed, as real clients do.
+	var seed [ed25519.SeedSize]byte
+	for i := range seed {
+		seed[i] = byte(i + 1)
+	}
+	clientPriv := ed25519.NewKeyFromSeed(seed[:])
+	clientEdPub := clientPriv.Public().(ed25519.PublicKey)
+	wantX, err := squic.Ed25519PublicToX25519(clientEdPub)
+	if err != nil {
+		t.Fatalf("convert client key: %v", err)
+	}
+	var want [32]byte
+	copy(want[:], wantX)
+
+	ln, err := squic.Listen("udp", "127.0.0.1:0", cert, pubKey, nil)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+	serverAddr := ln.Addr().String()
+
+	type result struct {
+		key   [32]byte
+		ok    bool
+		again bool
+	}
+	serverDone := make(chan result, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, err := ln.Accept(ctx)
+		if err != nil {
+			serverDone <- result{}
+			return
+		}
+		key, ok := ln.PeerKey(conn)
+		_, again := ln.PeerKey(conn) // idempotent: holder lives with the conn
+		serverDone <- result{key: key, ok: ok, again: again}
+		<-ctx.Done()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := squic.Dial(ctx, serverAddr, pubKey, &squic.Config{
+		ClientKey: hex.EncodeToString(seed[:]),
+	})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	// Open a stream so the handshake completes and the server accepts.
+	if _, err := conn.OpenStreamSync(ctx); err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+
+	r := <-serverDone
+	if !r.ok {
+		t.Fatal("PeerKey returned ok=false; expected the dialing client's key")
+	}
+	if r.key != want {
+		t.Errorf("PeerKey = %x, want %x", r.key, want)
+	}
+	if !r.again {
+		t.Error("second PeerKey call should still report the key (holder lives with the conn)")
+	}
+	conn.CloseWithError(0, "")
+}

@@ -24,6 +24,102 @@ func isQUICInitial(data []byte) bool {
 	return data[0]&0xF0 == 0xC0
 }
 
+// peerKeyTTL bounds how long a validated peer key is retained before the
+// connection is accepted. An Initial that passes MAC1 but whose handshake
+// never completes would otherwise leave its key indefinitely; a peer that can
+// pass MAC1 could fill the table. The window need only span first-Initial to
+// accept, which is sub-second in practice.
+const peerKeyTTL = 30 * time.Second
+
+// peerTablePruneAt is the live-entry count above which an insert first drops
+// expired entries, keeping the table bounded without a background goroutine.
+const peerTablePruneAt = 512
+
+type peerEntry struct {
+	key      [32]byte
+	inserted time.Time
+	// poisoned is set when two Initials shared a DCID with different keys. The
+	// connection can no longer be attributed to one identity, so the entry
+	// answers for neither.
+	poisoned bool
+}
+
+// peerTable maps a QUIC Destination Connection ID to the peer X25519 key that
+// MAC1 verified on the Initial carrying it, so the accepting application can
+// learn who it is talking to. See SIP-2. The DCID bytes are the map key.
+type peerTable struct {
+	mu      sync.Mutex
+	entries map[string]peerEntry
+}
+
+func newPeerTable() *peerTable {
+	return &peerTable{entries: make(map[string]peerEntry)}
+}
+
+// record stores dcid -> key for an Initial that just passed MAC1. A repeat of
+// the same DCID with the same key is a retransmission and refreshes the entry;
+// a repeat with a different key is a collision that cannot be resolved safely
+// (an on-path attacker could otherwise overwrite a victim's entry), so the
+// entry is poisoned and will answer for neither key.
+func (t *peerTable) record(dcid []byte, key [32]byte, now time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.entries) >= peerTablePruneAt {
+		for k, e := range t.entries {
+			if now.Sub(e.inserted) >= peerKeyTTL {
+				delete(t.entries, k)
+			}
+		}
+	}
+	k := string(dcid)
+	if e, ok := t.entries[k]; ok {
+		switch {
+		case e.poisoned:
+			// stays poisoned
+		case e.key == key:
+			e.inserted = now
+			t.entries[k] = e
+		default:
+			e.poisoned = true
+			t.entries[k] = e
+		}
+		return
+	}
+	t.entries[k] = peerEntry{key: key, inserted: now}
+}
+
+// take removes and returns the key for dcid, if one is recorded, not poisoned,
+// and not expired.
+func (t *peerTable) take(dcid []byte, now time.Time) ([32]byte, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	k := string(dcid)
+	e, ok := t.entries[k]
+	if !ok {
+		return [32]byte{}, false
+	}
+	delete(t.entries, k)
+	if e.poisoned || now.Sub(e.inserted) >= peerKeyTTL {
+		return [32]byte{}, false
+	}
+	return e.key, true
+}
+
+// initialDCID returns the Destination Connection ID of a QUIC long-header
+// (Initial) packet. Layout: byte 0 flags, bytes 1..5 version, byte 5 DCID
+// length (0..=20), bytes 6..6+len DCID. isQUICInitial has already checked the
+// flags.
+func initialDCID(pkt []byte) ([]byte, bool) {
+	if len(pkt) < 6 {
+		return nil, false
+	}
+	n := int(pkt[5])
+	if n > 20 || len(pkt) < 6+n {
+		return nil, false
+	}
+	return pkt[6 : 6+n], true
+}
+
 // clientConn wraps a *net.UDPConn for the client side.
 // It appends the client's X25519 public key and a DH-based MAC1 to outgoing Initial packets.
 // Implements OOBCapablePacketConn so quic-go uses the fast path (recvmmsg, sendmmsg, GSO, ECN).
@@ -296,6 +392,10 @@ type serverConn struct {
 	cookieReplies    atomic.Int64 // challenges issued since start
 	mac2Verified     atomic.Int64 // Initials admitted on a valid MAC2
 	loadThreshold    int64        // DH/sec before entering under-load mode
+
+	// peers maps DCID -> MAC1-verified peer key, drained by the application at
+	// accept via the ConnContext/Tracer bridge in Listen. See SIP-2.
+	peers *peerTable
 }
 
 // cookieSecrets returns the current and previous secrets under the read lock.
@@ -310,6 +410,7 @@ func newServerConn(conn *net.UDPConn, serverX25519Priv []byte, allowedKeys [][]b
 		conn:             conn,
 		serverX25519Priv: serverX25519Priv,
 		loadThreshold:    loadThreshold,
+		peers:            newPeerTable(),
 	}
 
 	sc.cookieKey = CookieKey(x25519Public(serverX25519Priv))
@@ -581,6 +682,16 @@ func (c *serverConn) validateAndStrip(p []byte, n int, addr *net.UDPAddr) (bool,
 
 	if !VerifyMAC1(shared, p[:quicLen], timestamp, nonce, mac1) {
 		return false, 0
+	}
+
+	// MAC1 holds: the caller possesses the private key for clientPub. Record it
+	// against the Initial's DCID so the application can recover the peer's
+	// identity at accept (SIP-2). This is the X25519 key; it is not converted
+	// to Ed25519, because that map does not run backwards.
+	if dcid, ok := initialDCID(p[:quicLen]); ok {
+		var key [32]byte
+		copy(key[:], clientPub)
+		c.peers.record(dcid, key, time.Now())
 	}
 
 	return true, quicLen

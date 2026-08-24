@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/qlogwriter"
 	"golang.org/x/crypto/curve25519"
 )
 
@@ -180,6 +181,20 @@ func (c *Config) nextProtos() []string {
 	return nil
 }
 
+// peerKeyCtxKey keys the per-connection peer-key holder carried in the
+// connection's context. Unexported so no other package can collide with it.
+type peerKeyCtxKey struct{}
+
+// peerKeyHolder carries the MAC1-verified peer key from the point where the
+// connection is created (where quic-go hands us its original destination CID
+// via the Tracer hook) to the point where the application asks for it. It is
+// installed by ConnContext and filled by the Tracer; both run before Accept
+// returns the connection.
+type peerKeyHolder struct {
+	key [32]byte
+	set bool
+}
+
 // ServerListener wraps a quic.Listener with silent-server support.
 type ServerListener struct {
 	*quic.Listener
@@ -218,8 +233,38 @@ func Listen(network, addr string, serverCert tls.Certificate, serverPubKey []byt
 	}
 	quicConf := config.quicConfig()
 
+	// Bridge the MAC1-verified peer key from the UDP receive path to the
+	// accepted connection (SIP-2). quic-go does not expose the original
+	// destination CID on an accepted connection, but it does hand it to the
+	// qlog Tracer, whose context is the one ConnContext returned and the one
+	// Conn.Context() later reports. So ConnContext installs an empty holder,
+	// the Tracer looks the CID up in the peer table and fills it, and PeerKey
+	// reads it back. No wire change; this only surfaces information already
+	// verified.
+	tr := &quic.Transport{
+		Conn: wrappedConn,
+		ConnContext: func(ctx context.Context, _ *quic.ClientInfo) (context.Context, error) {
+			return context.WithValue(ctx, peerKeyCtxKey{}, &peerKeyHolder{}), nil
+		},
+	}
+
+	prevTracer := quicConf.Tracer
+	quicConf.Tracer = func(ctx context.Context, isClient bool, connID quic.ConnectionID) qlogwriter.Trace {
+		if !isClient {
+			if h, ok := ctx.Value(peerKeyCtxKey{}).(*peerKeyHolder); ok {
+				if key, found := wrappedConn.peers.take(connID.Bytes(), time.Now()); found {
+					h.key = key
+					h.set = true
+				}
+			}
+		}
+		if prevTracer != nil {
+			return prevTracer(ctx, isClient, connID)
+		}
+		return nil
+	}
+
 	// StatelessResetKey left nil — disables stateless reset for silent server
-	tr := &quic.Transport{Conn: wrappedConn}
 	ln, err := tr.Listen(tlsConf, quicConf)
 	if err != nil {
 		rawConn.Close()
@@ -227,6 +272,23 @@ func Listen(network, addr string, serverCert tls.Certificate, serverPubKey []byt
 	}
 
 	return &ServerListener{Listener: ln, conn: rawConn, sc: wrappedConn}, nil
+}
+
+// PeerKey returns the peer's X25519 public key for an accepted connection, as
+// verified by MAC1 on its Initial packet, and true — or a zero key and false
+// if none was recorded (the connection did not pass MAC1, the DCID was
+// contested by two different keys, or the entry expired before accept).
+//
+// Pass a connection returned by Accept. This is the transport key; it is not
+// the caller's Ed25519 identity and cannot be converted to one — the
+// Ed25519 -> X25519 map does not run backwards. A caller authorising by
+// Ed25519 key holds the forward mapping and matches against it. See SIP-2.
+func (sl *ServerListener) PeerKey(conn *quic.Conn) ([32]byte, bool) {
+	h, ok := conn.Context().Value(peerKeyCtxKey{}).(*peerKeyHolder)
+	if !ok || !h.set {
+		return [32]byte{}, false
+	}
+	return h.key, true
 }
 
 // AllowKey adds a client X25519 public key to the whitelist at runtime.
