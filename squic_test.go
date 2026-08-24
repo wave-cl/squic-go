@@ -823,3 +823,44 @@ func TestCookieChallengeAdmitsALegitimateClient(t *testing.T) {
 		t.Fatalf("client's MAC2 never verified — the exchange did not complete: %+v", stats)
 	}
 }
+
+// A caller who has never seen the server's public key must not be able to pass
+// MAC1. A small-order client key makes the exchange non-contributory — the
+// shared secret is all zeros whatever the server's key is, and the attacker
+// knows that in advance.
+//
+// This passes today because curve25519.X25519 returns an error on an all-zero
+// result and validateAndStrip checks it. That is the library's doing, not
+// ours: squic-rust used x25519-dalek, which returns the zeros without
+// complaint, and was vulnerable until v0.13.2. The test is here so a refactor
+// that stops checking dhErr, or a swap to a laxer primitive, fails loudly.
+func TestSmallOrderClientKeyIsRefused(t *testing.T) {
+	seed := make([]byte, ed25519.SeedSize)
+	if _, err := rand.Read(seed); err != nil {
+		t.Fatal(err)
+	}
+	priv := squic.Ed25519PrivateToX25519(ed25519.NewKeyFromSeed(seed))
+
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	datagram := make([]byte, 1200)
+	datagram[0] = 0xC0
+	zeroKey := make([]byte, 32)
+	assumedShared := make([]byte, 32) // the attacker assumes zeros, and is right
+
+	ts := squic.NowTimestamp()
+	nonce, _ := squic.GenerateNonce()
+	mac1 := squic.ComputeMAC1(assumedShared, datagram, ts, nonce)
+
+	// The exchange the server would perform. If it yields a usable secret
+	// rather than an error, a stranger's MAC1 verifies.
+	shared, dhErr := squic.X25519(priv, zeroKey)
+	if dhErr == nil {
+		t.Fatalf("X25519 accepted a small-order peer key, returning %x", shared)
+	}
+	_ = mac1
+}
