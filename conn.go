@@ -2,6 +2,7 @@ package squic
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/binary"
 	"net"
 	"sync"
@@ -36,8 +37,12 @@ const peerKeyTTL = 30 * time.Second
 const peerTablePruneAt = 512
 
 type peerEntry struct {
-	key      [32]byte
-	inserted time.Time
+	key [32]byte
+	// identity is the MAC1-bound Ed25519 key (SIP-3) that forward-derived to
+	// key, valid only when hasIdentity is set. Absent for anonymous callers.
+	identity    [32]byte
+	hasIdentity bool
+	inserted    time.Time
 	// poisoned is set when two Initials shared a DCID with different keys. The
 	// connection can no longer be attributed to one identity, so the entry
 	// answers for neither.
@@ -61,7 +66,7 @@ func newPeerTable() *peerTable {
 // a repeat with a different key is a collision that cannot be resolved safely
 // (an on-path attacker could otherwise overwrite a victim's entry), so the
 // entry is poisoned and will answer for neither key.
-func (t *peerTable) record(dcid []byte, key [32]byte, now time.Time) {
+func (t *peerTable) record(dcid []byte, key [32]byte, identity [32]byte, hasIdentity bool, now time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if len(t.entries) >= peerTablePruneAt {
@@ -76,7 +81,7 @@ func (t *peerTable) record(dcid []byte, key [32]byte, now time.Time) {
 		switch {
 		case e.poisoned:
 			// stays poisoned
-		case e.key == key:
+		case e.key == key && e.identity == identity && e.hasIdentity == hasIdentity:
 			e.inserted = now
 			t.entries[k] = e
 		default:
@@ -85,24 +90,27 @@ func (t *peerTable) record(dcid []byte, key [32]byte, now time.Time) {
 		}
 		return
 	}
-	t.entries[k] = peerEntry{key: key, inserted: now}
+	t.entries[k] = peerEntry{key: key, identity: identity, hasIdentity: hasIdentity, inserted: now}
 }
 
-// take removes and returns the key for dcid, if one is recorded, not poisoned,
-// and not expired.
-func (t *peerTable) take(dcid []byte, now time.Time) ([32]byte, bool) {
+// take removes and returns the (key, identity) for dcid, if one is recorded,
+// not poisoned, and not expired. It returns both so the one read the bridge
+// performs surfaces the SIP-2 key and the SIP-3 identity together. The bool
+// results are: hasIdentity (an Ed25519 identity was bound) and ok (an entry
+// resolved at all).
+func (t *peerTable) take(dcid []byte, now time.Time) (key [32]byte, identity [32]byte, hasIdentity bool, ok bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	k := string(dcid)
-	e, ok := t.entries[k]
-	if !ok {
-		return [32]byte{}, false
+	e, present := t.entries[k]
+	if !present {
+		return [32]byte{}, [32]byte{}, false, false
 	}
 	delete(t.entries, k)
 	if e.poisoned || now.Sub(e.inserted) >= peerKeyTTL {
-		return [32]byte{}, false
+		return [32]byte{}, [32]byte{}, false, false
 	}
-	return e.key, true
+	return e.key, e.identity, e.hasIdentity, true
 }
 
 // initialDCID returns the Destination Connection ID of a QUIC long-header
@@ -124,13 +132,14 @@ func initialDCID(pkt []byte) ([]byte, bool) {
 // It appends the client's X25519 public key and a DH-based MAC1 to outgoing Initial packets.
 // Implements OOBCapablePacketConn so quic-go uses the fast path (recvmmsg, sendmmsg, GSO, ECN).
 type clientConn struct {
-	conn          *net.UDPConn
-	batchReader   *ipv4.PacketConn // lazy-initialised for ReadBatch
-	sharedSecret  []byte           // X25519(clientPriv, serverPub)
-	clientPubKey  []byte           // 32-byte X25519 public key
-	cookieKey     [32]byte         // decrypts cookie replies; derived from the server's public key
-	handshakeDone atomic.Bool      // true after first non-cookie packet; skips the cookie scan
-	cookie        atomic.Value     // decrypted 16-byte cookie from the server, keys MAC2
+	conn             *net.UDPConn
+	batchReader      *ipv4.PacketConn // lazy-initialised for ReadBatch
+	sharedSecret     []byte           // X25519(clientPriv, serverPub)
+	clientPubKey     []byte           // 32-byte X25519 public key
+	advertiseEd25519 []byte           // SIP-3: 32-byte Ed25519 identity to assert, or 32 zero bytes
+	cookieKey        [32]byte         // decrypts cookie replies; derived from the server's public key
+	handshakeDone    atomic.Bool      // true after first non-cookie packet; skips the cookie scan
+	cookie           atomic.Value     // decrypted 16-byte cookie from the server, keys MAC2
 	// The most recent Initial datagram and where it went, so a cookie
 	// challenge can be answered immediately rather than at the next PTO.
 	lastInitial atomic.Value // holds sentInitial
@@ -143,12 +152,18 @@ type sentInitial struct {
 	addr     *net.UDPAddr
 }
 
-func newClientConn(conn *net.UDPConn, sharedSecret, clientX25519Pub []byte, cookieKey [32]byte) *clientConn {
+func newClientConn(conn *net.UDPConn, sharedSecret, clientX25519Pub, advertiseEd25519 []byte, cookieKey [32]byte) *clientConn {
+	// Always a 32-byte field so the client's MAC1 input and the bytes on the
+	// wire match what the server reads and hashes (all zeros = no identity).
+	if len(advertiseEd25519) != Ed25519Size {
+		advertiseEd25519 = make([]byte, Ed25519Size)
+	}
 	return &clientConn{
-		conn:         conn,
-		sharedSecret: sharedSecret,
-		clientPubKey: clientX25519Pub,
-		cookieKey:    cookieKey,
+		conn:             conn,
+		sharedSecret:     sharedSecret,
+		clientPubKey:     clientX25519Pub,
+		advertiseEd25519: advertiseEd25519,
+		cookieKey:        cookieKey,
 	}
 }
 
@@ -321,13 +336,15 @@ func (c *clientConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 func (c *clientConn) buildInitial(p []byte) []byte {
 	ts := NowTimestamp()
 	nonce, _ := GenerateNonce()
-	mac1 := ComputeMAC1(c.sharedSecret, p, ts, nonce)
+	mac1 := ComputeMAC1(c.sharedSecret, p, c.advertiseEd25519, ts, nonce)
 
 	buf := make([]byte, len(p)+MACOverhead)
 	copy(buf, p)
 	off := len(p)
 	copy(buf[off:], c.clientPubKey)
 	off += ClientKeySize
+	copy(buf[off:], c.advertiseEd25519) // SIP-3: Ed25519 identity, or zeros
+	off += Ed25519Size
 	binary.BigEndian.PutUint32(buf[off:], ts)
 	off += TimestampSize
 	copy(buf[off:], nonce)
@@ -608,6 +625,8 @@ func (c *serverConn) validateAndStrip(p []byte, n int, addr *net.UDPAddr) (bool,
 	off := quicLen
 	clientPub := p[off : off+ClientKeySize]
 	off += ClientKeySize
+	edField := p[off : off+Ed25519Size]
+	off += Ed25519Size
 	tsBytes := p[off : off+TimestampSize]
 	off += TimestampSize
 	nonce := p[off : off+NonceSize]
@@ -680,18 +699,44 @@ func (c *serverConn) validateAndStrip(p []byte, n int, addr *net.UDPAddr) (bool,
 		return false, 0
 	}
 
-	if !VerifyMAC1(shared, p[:quicLen], timestamp, nonce, mac1) {
+	if !VerifyMAC1(shared, p[:quicLen], edField, timestamp, nonce, mac1) {
 		return false, 0
 	}
 
-	// MAC1 holds: the caller possesses the private key for clientPub. Record it
-	// against the Initial's DCID so the application can recover the peer's
-	// identity at accept (SIP-2). This is the X25519 key; it is not converted
-	// to Ed25519, because that map does not run backwards.
+	// SIP-3: if the caller asserted an Ed25519 identity (nonzero field), it must
+	// forward-derive to the X25519 key MAC1 just proved. The map runs this way
+	// even though it does not run backwards; the caller states which key is its
+	// own and the server checks the statement. A mismatch, a non-point key, or a
+	// small-order point fails the handshake rather than downgrading to anonymous.
+	//
+	// All zeros means "no identity asserted". It is a *valid* point — the order-4
+	// point, deriving to u = 1 — not an invalid encoding, so it is matched
+	// explicitly rather than left to fail the derivation.
+	var identity [32]byte
+	hasIdentity := false
+	edZero := true
+	for _, b := range edField {
+		if b != 0 {
+			edZero = false
+			break
+		}
+	}
+	if !edZero {
+		derived, edErr := Ed25519IdentityToX25519(edField)
+		if edErr != nil || subtle.ConstantTimeCompare(derived, clientPub) != 1 {
+			return false, 0
+		}
+		copy(identity[:], edField)
+		hasIdentity = true
+	}
+
+	// MAC1 holds: the caller possesses the private key for clientPub (SIP-2), and
+	// the Ed25519 field is authenticated. Record both against the Initial's DCID
+	// so the application can recover the peer at accept (SIP-2 key, SIP-3 id).
 	if dcid, ok := initialDCID(p[:quicLen]); ok {
 		var key [32]byte
 		copy(key[:], clientPub)
-		c.peers.record(dcid, key, time.Now())
+		c.peers.record(dcid, key, identity, hasIdentity, time.Now())
 	}
 
 	return true, quicLen

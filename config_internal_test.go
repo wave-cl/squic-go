@@ -75,7 +75,7 @@ func TestAnswerChallengeRetransmitsImmediately(t *testing.T) {
 
 	var cookieKey [32]byte
 	rand.Read(cookieKey[:])
-	c := newClientConn(local, make([]byte, 32), make([]byte, 32), cookieKey)
+	c := newClientConn(local, make([]byte, 32), make([]byte, 32), nil, cookieKey)
 
 	// A cookie arriving before anything has been sent must not panic and must
 	// not invent a packet.

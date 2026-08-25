@@ -88,6 +88,13 @@ type Config struct {
 	// The client's X25519 public key is derived from this for MAC1 and whitelist matching.
 	ClientKey string
 
+	// AdvertiseIdentity, when set with ClientKey, carries this client's Ed25519
+	// identity in the Initial envelope so the server can report it at accept via
+	// PeerIdentity without pre-registering the caller (SIP-3). Ignored without
+	// ClientKey. Default false — the caller stays anonymous on the wire, since
+	// the identity is server-visible plaintext.
+	AdvertiseIdentity bool
+
 	// LoadThreshold is the DH operations per second before the server enters
 	// under-load mode and starts requiring a cookie (MAC2) from callers it has
 	// not challenged yet.
@@ -193,6 +200,10 @@ type peerKeyCtxKey struct{}
 type peerKeyHolder struct {
 	key [32]byte
 	set bool
+	// identity is the MAC1-bound Ed25519 identity (SIP-3), valid when
+	// hasIdentity is set. Filled by the same one take() the Tracer performs.
+	identity    [32]byte
+	hasIdentity bool
 }
 
 // ServerListener wraps a quic.Listener with silent-server support.
@@ -252,9 +263,11 @@ func Listen(network, addr string, serverCert tls.Certificate, serverPubKey []byt
 	quicConf.Tracer = func(ctx context.Context, isClient bool, connID quic.ConnectionID) qlogwriter.Trace {
 		if !isClient {
 			if h, ok := ctx.Value(peerKeyCtxKey{}).(*peerKeyHolder); ok {
-				if key, found := wrappedConn.peers.take(connID.Bytes(), time.Now()); found {
+				if key, identity, hasIdentity, found := wrappedConn.peers.take(connID.Bytes(), time.Now()); found {
 					h.key = key
 					h.set = true
+					h.identity = identity
+					h.hasIdentity = hasIdentity
 				}
 			}
 		}
@@ -289,6 +302,23 @@ func (sl *ServerListener) PeerKey(conn *quic.Conn) ([32]byte, bool) {
 		return [32]byte{}, false
 	}
 	return h.key, true
+}
+
+// PeerIdentity returns the peer's MAC1-bound Ed25519 identity for an accepted
+// connection (SIP-3), and true — or a zero key and false if the caller
+// advertised none (the common, anonymous case), the DCID was contested, or the
+// entry expired before accept.
+//
+// When present, the transport proved possession of the matching scalar and the
+// server checked that this Ed25519 key forward-derives to the verified X25519
+// key, so an open-set service may name and authorise the caller by it without
+// having pre-registered it. Pass a connection returned by Accept.
+func (sl *ServerListener) PeerIdentity(conn *quic.Conn) ([32]byte, bool) {
+	h, ok := conn.Context().Value(peerKeyCtxKey{}).(*peerKeyHolder)
+	if !ok || !h.set || !h.hasIdentity {
+		return [32]byte{}, false
+	}
+	return h.identity, true
 }
 
 // AllowKey adds a client X25519 public key to the whitelist at runtime.
@@ -414,8 +444,10 @@ func Dial(ctx context.Context, addr string, serverPubKey []byte, config *Config)
 		return nil, fmt.Errorf("squic: convert server key: %w", err)
 	}
 
-	// Derive or generate X25519 key pair for this connection
+	// Derive or generate X25519 key pair for this connection, and the Ed25519
+	// identity (if any) it came from — the latter may be advertised (SIP-3).
 	var clientPriv [32]byte
+	var advertiseEd25519 []byte
 	if config != nil && config.ClientKey != "" {
 		// Persistent client identity: derive X25519 from Ed25519 seed
 		ed25519Pub, err := hex.DecodeString(config.ClientKey)
@@ -427,7 +459,9 @@ func Dial(ctx context.Context, addr string, serverPubKey []byte, config *Config)
 		pub := priv.Public().(ed25519.PublicKey)
 		x25519Priv := Ed25519PrivateToX25519(priv)
 		copy(clientPriv[:], x25519Priv)
-		_ = pub // Ed25519 public key available if needed for TLS cert
+		if config.AdvertiseIdentity {
+			advertiseEd25519 = pub // SIP-3: assert this identity in the envelope
+		}
 	} else {
 		// Ephemeral: random X25519 key pair
 		if _, err := rand.Read(clientPriv[:]); err != nil {
@@ -449,7 +483,7 @@ func Dial(ctx context.Context, addr string, serverPubKey []byte, config *Config)
 	}
 
 	// Wrap with DH MAC1 appending
-	wrappedConn := newClientConn(rawConn, shared, clientPub, CookieKey(serverX25519Pub))
+	wrappedConn := newClientConn(rawConn, shared, clientPub, advertiseEd25519, CookieKey(serverX25519Pub))
 
 	tlsConf := ClientTLSConfig(serverPubKey)
 	if protos := config.nextProtos(); protos != nil {

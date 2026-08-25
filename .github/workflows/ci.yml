@@ -28,7 +28,7 @@ jobs:
         run: go test -race ./...
 
   cross-impl:
-    name: Cross-implementation peer-key test
+    name: Cross-implementation peer-key / peer-identity test
     runs-on: ubuntu-latest
     steps:
       # Both repos into sibling subdirs so the harness's default
@@ -53,5 +53,9 @@ jobs:
         with:
           workspaces: squic-rust
 
-      - name: Cross-implementation peer-key test
+      # Covers the SIP-2 peer key and the SIP-3 peer identity, advertised and
+      # anonymous, across the Rust x Go matrix. NOTE: this checks out the
+      # sibling repo's default branch, so during a wire flag-day (SIP-3) it
+      # fails until BOTH mains carry the change — re-run after the second push.
+      - name: Cross-implementation peer-key / peer-identity test
         run: bash squic-go/scripts/cross_peerkey_test.sh

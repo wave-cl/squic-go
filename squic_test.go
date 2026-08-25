@@ -22,23 +22,27 @@ func TestMAC1RoundTrip(t *testing.T) {
 	rand.Read(sharedSecret)
 
 	data := []byte("test packet data")
+	ed := make([]byte, squic.Ed25519Size)
+	for i := range ed {
+		ed[i] = 0x11
+	}
 	ts := squic.NowTimestamp()
 	nonce, _ := squic.GenerateNonce()
-	mac := squic.ComputeMAC1(sharedSecret, data, ts, nonce)
+	mac := squic.ComputeMAC1(sharedSecret, data, ed, ts, nonce)
 
 	if len(mac) != squic.MACSize {
 		t.Fatalf("MAC1 length = %d, want %d", len(mac), squic.MACSize)
 	}
 
 	// Verify MAC1
-	if !squic.VerifyMAC1(sharedSecret, data, ts, nonce, mac) {
+	if !squic.VerifyMAC1(sharedSecret, data, ed, ts, nonce, mac) {
 		t.Error("valid MAC1 failed verification")
 	}
 
 	// Wrong key should fail
 	wrongKey := make([]byte, 32)
 	rand.Read(wrongKey)
-	if squic.VerifyMAC1(wrongKey, data, ts, nonce, mac) {
+	if squic.VerifyMAC1(wrongKey, data, ed, ts, nonce, mac) {
 		t.Error("MAC1 should fail with wrong key")
 	}
 
@@ -46,19 +50,27 @@ func TestMAC1RoundTrip(t *testing.T) {
 	tampered := make([]byte, len(data))
 	copy(tampered, data)
 	tampered[0] ^= 0xFF
-	if squic.VerifyMAC1(sharedSecret, tampered, ts, nonce, mac) {
+	if squic.VerifyMAC1(sharedSecret, tampered, ed, ts, nonce, mac) {
 		t.Error("MAC1 should fail with tampered data")
 	}
 
+	// Tampered Ed25519 identity field should fail (SIP-3: it is in the MAC1 input)
+	ed2 := make([]byte, squic.Ed25519Size)
+	copy(ed2, ed)
+	ed2[0] ^= 0xFF
+	if squic.VerifyMAC1(sharedSecret, data, ed2, ts, nonce, mac) {
+		t.Error("MAC1 should fail with tampered Ed25519 field")
+	}
+
 	// Wrong timestamp should fail
-	if squic.VerifyMAC1(sharedSecret, data, ts+1, nonce, mac) {
+	if squic.VerifyMAC1(sharedSecret, data, ed, ts+1, nonce, mac) {
 		t.Error("MAC1 should fail with different timestamp")
 	}
 
 	// Wrong nonce should fail
 	wrongNonce := make([]byte, squic.NonceSize)
 	rand.Read(wrongNonce)
-	if squic.VerifyMAC1(sharedSecret, data, ts, wrongNonce, mac) {
+	if squic.VerifyMAC1(sharedSecret, data, ed, ts, wrongNonce, mac) {
 		t.Error("MAC1 should fail with different nonce")
 	}
 }
@@ -852,9 +864,10 @@ func TestSmallOrderClientKeyIsRefused(t *testing.T) {
 	zeroKey := make([]byte, 32)
 	assumedShared := make([]byte, 32) // the attacker assumes zeros, and is right
 
+	ed := make([]byte, squic.Ed25519Size)
 	ts := squic.NowTimestamp()
 	nonce, _ := squic.GenerateNonce()
-	mac1 := squic.ComputeMAC1(assumedShared, datagram, ts, nonce)
+	mac1 := squic.ComputeMAC1(assumedShared, datagram, ed, ts, nonce)
 
 	// The exchange the server would perform. If it yields a usable secret
 	// rather than an error, a stranger's MAC1 verifies.
@@ -937,4 +950,170 @@ func TestPeerKeyMatchesDialingClient(t *testing.T) {
 		t.Error("second PeerKey call should still report the key (holder lives with the conn)")
 	}
 	conn.CloseWithError(0, "")
+}
+
+// SIP-3: a client that opts in carries its Ed25519 identity in the Initial, and
+// the server reports it at accept via PeerIdentity with no prior registration.
+func TestPeerIdentityReportedWhenAdvertised(t *testing.T) {
+	cert, pubKey, err := squic.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+	var seed [ed25519.SeedSize]byte
+	for i := range seed {
+		seed[i] = byte(i + 7)
+	}
+	clientPriv := ed25519.NewKeyFromSeed(seed[:])
+	clientEdPub := clientPriv.Public().(ed25519.PublicKey)
+	var wantID [32]byte
+	copy(wantID[:], clientEdPub)
+
+	ln, err := squic.Listen("udp", "127.0.0.1:0", cert, pubKey, nil)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+
+	type result struct {
+		keyOK bool
+		id    [32]byte
+		idOK  bool
+	}
+	serverDone := make(chan result, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, err := ln.Accept(ctx)
+		if err != nil {
+			serverDone <- result{}
+			return
+		}
+		_, keyOK := ln.PeerKey(conn)
+		id, idOK := ln.PeerIdentity(conn)
+		serverDone <- result{keyOK: keyOK, id: id, idOK: idOK}
+		<-ctx.Done()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := squic.Dial(ctx, ln.Addr().String(), pubKey, &squic.Config{
+		ClientKey:         hex.EncodeToString(seed[:]),
+		AdvertiseIdentity: true,
+	})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	if _, err := conn.OpenStreamSync(ctx); err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+
+	r := <-serverDone
+	if !r.keyOK {
+		t.Error("PeerKey should still resolve")
+	}
+	if !r.idOK || r.id != wantID {
+		t.Errorf("PeerIdentity = %x ok=%v, want %x", r.id, r.idOK, wantID)
+	}
+	conn.CloseWithError(0, "")
+}
+
+// SIP-3 is opt-in: the default client is anonymous — PeerIdentity is absent
+// though PeerKey still resolves.
+func TestPeerIdentityAbsentByDefault(t *testing.T) {
+	cert, pubKey, err := squic.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+	var seed [ed25519.SeedSize]byte
+	for i := range seed {
+		seed[i] = byte(i + 7)
+	}
+
+	ln, err := squic.Listen("udp", "127.0.0.1:0", cert, pubKey, nil)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+
+	type result struct {
+		keyOK bool
+		idOK  bool
+	}
+	serverDone := make(chan result, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, err := ln.Accept(ctx)
+		if err != nil {
+			serverDone <- result{}
+			return
+		}
+		_, keyOK := ln.PeerKey(conn)
+		_, idOK := ln.PeerIdentity(conn)
+		serverDone <- result{keyOK: keyOK, idOK: idOK}
+		<-ctx.Done()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := squic.Dial(ctx, ln.Addr().String(), pubKey, &squic.Config{
+		ClientKey: hex.EncodeToString(seed[:]),
+		// AdvertiseIdentity defaults to false
+	})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	if _, err := conn.OpenStreamSync(ctx); err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+
+	r := <-serverDone
+	if !r.keyOK {
+		t.Error("PeerKey should resolve")
+	}
+	if r.idOK {
+		t.Error("PeerIdentity should be absent when not advertised")
+	}
+	conn.CloseWithError(0, "")
+}
+
+// The strict identity map (SIP-3) must refuse torsion. All zeros is the case
+// that matters: it is a *valid* order-4 point, not an invalid encoding, so the
+// permissive map happily returns u = 1 for it.
+func TestIdentityMapRefusesSmallOrder(t *testing.T) {
+	zeros := make([]byte, 32)
+
+	loose, err := squic.Ed25519PublicToX25519(zeros)
+	if err != nil {
+		t.Fatalf("permissive map should accept the order-4 point: %v", err)
+	}
+	want := make([]byte, 32)
+	want[0] = 1
+	if !bytes.Equal(loose, want) {
+		t.Errorf("all-zero Ed25519 maps to %x, want u = 1", loose)
+	}
+
+	if _, err := squic.Ed25519IdentityToX25519(zeros); err == nil {
+		t.Error("strict map must refuse a small-order identity")
+	}
+}
+
+// A genuine key is in the prime-order subgroup, so the strict map accepts it
+// and agrees with the permissive one.
+func TestIdentityMapAcceptsRealKey(t *testing.T) {
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	strict, err := squic.Ed25519IdentityToX25519(pub)
+	if err != nil {
+		t.Fatalf("strict map rejected a real key: %v", err)
+	}
+	loose, err := squic.Ed25519PublicToX25519(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(strict, loose) {
+		t.Error("strict and permissive maps disagree on a real key")
+	}
 }

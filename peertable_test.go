@@ -9,42 +9,63 @@ func TestPeerTableSameKeyIdempotent(t *testing.T) {
 	pt := newPeerTable()
 	now := time.Now()
 	k := [32]byte{1}
-	pt.record([]byte("cid1"), k, now)
-	pt.record([]byte("cid1"), k, now) // retransmission
-	got, ok := pt.take([]byte("cid1"), now)
-	if !ok || got != k {
-		t.Fatalf("take = %x, %v; want %x, true", got, ok, k)
+	id := [32]byte{9}
+	pt.record([]byte("cid1"), k, id, true, now)
+	pt.record([]byte("cid1"), k, id, true, now) // retransmission
+	got, gotID, hasID, ok := pt.take([]byte("cid1"), now)
+	if !ok || got != k || !hasID || gotID != id {
+		t.Fatalf("take = %x id=%x has=%v ok=%v; want key %x id %x", got, gotID, hasID, ok, k, id)
 	}
 }
 
 func TestPeerTableContestedIsPoisoned(t *testing.T) {
 	pt := newPeerTable()
 	now := time.Now()
-	pt.record([]byte("cid1"), [32]byte{1}, now)
-	pt.record([]byte("cid1"), [32]byte{2}, now) // different key, same DCID
-	if _, ok := pt.take([]byte("cid1"), now); ok {
+	pt.record([]byte("cid1"), [32]byte{1}, [32]byte{}, false, now)
+	pt.record([]byte("cid1"), [32]byte{2}, [32]byte{}, false, now) // different key, same DCID
+	if _, _, _, ok := pt.take([]byte("cid1"), now); ok {
 		t.Fatal("poisoned entry must not resolve")
+	}
+}
+
+func TestPeerTableContestedIdentityIsPoisoned(t *testing.T) {
+	pt := newPeerTable()
+	now := time.Now()
+	pt.record([]byte("cid1"), [32]byte{1}, [32]byte{9}, true, now)
+	pt.record([]byte("cid1"), [32]byte{1}, [32]byte{8}, true, now) // same key, different identity
+	if _, _, _, ok := pt.take([]byte("cid1"), now); ok {
+		t.Fatal("contested identity must poison the entry")
 	}
 }
 
 func TestPeerTableTakeDrains(t *testing.T) {
 	pt := newPeerTable()
 	now := time.Now()
-	pt.record([]byte("cid1"), [32]byte{7}, now)
-	if _, ok := pt.take([]byte("cid1"), now); !ok {
+	pt.record([]byte("cid1"), [32]byte{7}, [32]byte{}, false, now)
+	if _, _, _, ok := pt.take([]byte("cid1"), now); !ok {
 		t.Fatal("first take should succeed")
 	}
-	if _, ok := pt.take([]byte("cid1"), now); ok {
+	if _, _, _, ok := pt.take([]byte("cid1"), now); ok {
 		t.Fatal("second take should find nothing")
+	}
+}
+
+func TestPeerTableAnonymousHasNoIdentity(t *testing.T) {
+	pt := newPeerTable()
+	now := time.Now()
+	pt.record([]byte("cid1"), [32]byte{7}, [32]byte{}, false, now)
+	_, _, hasID, ok := pt.take([]byte("cid1"), now)
+	if !ok || hasID {
+		t.Fatalf("anonymous entry: ok=%v hasIdentity=%v; want ok=true hasIdentity=false", ok, hasID)
 	}
 }
 
 func TestPeerTableExpiry(t *testing.T) {
 	pt := newPeerTable()
 	start := time.Now()
-	pt.record([]byte("cid1"), [32]byte{9}, start)
+	pt.record([]byte("cid1"), [32]byte{9}, [32]byte{}, false, start)
 	later := start.Add(peerKeyTTL + time.Second)
-	if _, ok := pt.take([]byte("cid1"), later); ok {
+	if _, _, _, ok := pt.take([]byte("cid1"), later); ok {
 		t.Fatal("expired entry must not resolve")
 	}
 }

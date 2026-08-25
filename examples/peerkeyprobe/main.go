@@ -1,15 +1,19 @@
-// Cross-implementation probe for the SIP-2 peer-key accessor.
+// Cross-implementation probe for the SIP-2 peer-key and SIP-3 peer-identity
+// accessors.
 //
 // server: load a fixed keypair, accept one connection, print the peer key the
 //
-//	transport verified as PEERKEY=<hex>, then complete the handshake.
+//	transport verified as PEERKEY=<hex> and the Ed25519 identity it bound
+//	as PEERID=<hex> (or PEERID=none), then complete the handshake.
 //
 // client: dial with a fixed client key and print the X25519 key it will send
 //
-//	as CLIENTX=<hex>.
+//	as CLIENTX=<hex>, plus the Ed25519 identity it advertises as
+//	CLIENTED=<hex> — or CLIENTED=none without -advertise.
 //
 // A harness runs this against the Rust probe in every client/server
-// combination and asserts every PEERKEY equals every CLIENTX.
+// combination and asserts every PEERKEY equals every CLIENTX, and every PEERID
+// equals every CLIENTED (covering both the advertised and anonymous cases).
 package main
 
 import (
@@ -33,13 +37,14 @@ func main() {
 	serverKey := flag.String("server-key", "", "server Ed25519 seed (hex), server mode")
 	serverPub := flag.String("server-pub", "", "server Ed25519 public key (hex), client mode")
 	clientKey := flag.String("client-key", "", "client Ed25519 seed (hex), client mode")
+	advertise := flag.Bool("advertise", false, "advertise the client Ed25519 identity (SIP-3)")
 	flag.Parse()
 
 	switch {
 	case *server:
 		runServer(*port, *serverKey)
 	case *client:
-		runClient(*host, *port, *serverPub, *clientKey)
+		runClient(*host, *port, *serverPub, *clientKey, *advertise)
 	default:
 		fmt.Fprintln(os.Stderr, "specify -server or -client")
 		os.Exit(2)
@@ -74,6 +79,11 @@ func runServer(port int, serverKeyHex string) {
 	} else {
 		fmt.Println("PEERKEY=none")
 	}
+	if id, ok := ln.PeerIdentity(conn); ok {
+		fmt.Printf("PEERID=%s\n", hex.EncodeToString(id[:]))
+	} else {
+		fmt.Println("PEERID=none")
+	}
 	// Complete the exchange so the client does not error.
 	stream, err := conn.AcceptStream(ctx)
 	if err == nil {
@@ -84,7 +94,7 @@ func runServer(port int, serverKeyHex string) {
 	}
 }
 
-func runClient(host string, port int, serverPubHex, clientKeyHex string) {
+func runClient(host string, port int, serverPubHex, clientKeyHex string, advertise bool) {
 	serverPub, err := hex.DecodeString(serverPubHex)
 	if err != nil {
 		fail("decode server-pub", err)
@@ -101,11 +111,17 @@ func runClient(host string, port int, serverPubHex, clientKeyHex string) {
 		fail("convert client key", err)
 	}
 	fmt.Printf("CLIENTX=%s\n", hex.EncodeToString(x))
+	if advertise {
+		fmt.Printf("CLIENTED=%s\n", hex.EncodeToString(edPub))
+	} else {
+		fmt.Println("CLIENTED=none")
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	conn, err := squic.Dial(ctx, fmt.Sprintf("%s:%d", host, port), serverPub, &squic.Config{
-		ClientKey: clientKeyHex,
+		ClientKey:         clientKeyHex,
+		AdvertiseIdentity: advertise,
 	})
 	if err != nil {
 		fail("dial", err)

@@ -20,6 +20,10 @@ const (
 	// ClientKeySize is the size of an X25519 public key appended to Initial packets.
 	ClientKeySize = 32
 
+	// Ed25519Size is the size of the carried Ed25519 identity field (SIP-3).
+	// All-zero means "no identity asserted".
+	Ed25519Size = 32
+
 	// TimestampSize is the size of the replay-protection timestamp (uint32 epoch seconds).
 	TimestampSize = 4
 
@@ -29,9 +33,10 @@ const (
 	// MAC2Size is the size of the MAC2 tag in bytes.
 	MAC2Size = 16
 
-	// MACOverhead is the total overhead appended to Initial packets:
-	// 32-byte client X25519 public key + 4-byte timestamp + 8-byte nonce + 16-byte MAC1 + 16-byte MAC2.
-	MACOverhead = ClientKeySize + TimestampSize + NonceSize + MACSize + MAC2Size
+	// MACOverhead is the total overhead appended to Initial packets (SIP-3):
+	// 32-byte client X25519 public key + 32-byte Ed25519 identity + 4-byte
+	// timestamp + 8-byte nonce + 16-byte MAC1 + 16-byte MAC2.
+	MACOverhead = ClientKeySize + Ed25519Size + TimestampSize + NonceSize + MACSize + MAC2Size
 
 	// CookieReplyType is the first byte of a cookie reply packet.
 	// Distinguishes from QUIC packets (Initial starts with 0xC0+).
@@ -46,10 +51,17 @@ const (
 )
 
 // ComputeMAC1 computes a MAC1 tag with a timestamp and nonce for replay protection.
-// MAC1 = HMAC-SHA256(sharedSecret, data || timestamp || nonce)[:16]
-func ComputeMAC1(sharedSecret []byte, data []byte, timestamp uint32, nonce []byte) []byte {
+// MAC1 = HMAC-SHA256(sharedSecret, data || ed25519 || timestamp || nonce)[:16]
+//
+// SIP-3: the carried Ed25519 identity field is part of the MAC1 input (it does
+// not feed the shared secret, so leaving it unauthenticated would let an on-path
+// attacker substitute the sign-conjugate key and flip the reported identity).
+// ed25519 is the 32-byte field exactly as it appears on the wire (all zeros when
+// no identity is asserted).
+func ComputeMAC1(sharedSecret []byte, data []byte, ed25519 []byte, timestamp uint32, nonce []byte) []byte {
 	mac := hmac.New(sha256.New, sharedSecret)
 	mac.Write(data)
+	mac.Write(ed25519)
 	var ts [4]byte
 	binary.BigEndian.PutUint32(ts[:], timestamp)
 	mac.Write(ts[:])
@@ -57,9 +69,10 @@ func ComputeMAC1(sharedSecret []byte, data []byte, timestamp uint32, nonce []byt
 	return mac.Sum(nil)[:MACSize]
 }
 
-// VerifyMAC1 checks a MAC1 tag against data, timestamp, nonce, and shared secret.
-func VerifyMAC1(sharedSecret []byte, data []byte, timestamp uint32, nonce []byte, mac1 []byte) bool {
-	expected := ComputeMAC1(sharedSecret, data, timestamp, nonce)
+// VerifyMAC1 checks a MAC1 tag against data, the ed25519 field, timestamp,
+// nonce, and shared secret.
+func VerifyMAC1(sharedSecret []byte, data []byte, ed25519 []byte, timestamp uint32, nonce []byte, mac1 []byte) bool {
+	expected := ComputeMAC1(sharedSecret, data, ed25519, timestamp, nonce)
 	return subtle.ConstantTimeCompare(mac1, expected) == 1
 }
 
