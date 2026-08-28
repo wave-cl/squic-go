@@ -28,21 +28,21 @@ func TestMAC1RoundTrip(t *testing.T) {
 	}
 	ts := squic.NowTimestamp()
 	nonce, _ := squic.GenerateNonce()
-	mac := squic.ComputeMAC1(sharedSecret, data, ed, ts, nonce)
+	mac := squic.ComputeMAC1(squic.EnvelopeV1, sharedSecret, data, ed, ts, nonce)
 
 	if len(mac) != squic.MACSize {
 		t.Fatalf("MAC1 length = %d, want %d", len(mac), squic.MACSize)
 	}
 
 	// Verify MAC1
-	if !squic.VerifyMAC1(sharedSecret, data, ed, ts, nonce, mac) {
+	if !squic.VerifyMAC1(squic.EnvelopeV1, sharedSecret, data, ed, ts, nonce, mac) {
 		t.Error("valid MAC1 failed verification")
 	}
 
 	// Wrong key should fail
 	wrongKey := make([]byte, 32)
 	rand.Read(wrongKey)
-	if squic.VerifyMAC1(wrongKey, data, ed, ts, nonce, mac) {
+	if squic.VerifyMAC1(squic.EnvelopeV1, wrongKey, data, ed, ts, nonce, mac) {
 		t.Error("MAC1 should fail with wrong key")
 	}
 
@@ -50,7 +50,7 @@ func TestMAC1RoundTrip(t *testing.T) {
 	tampered := make([]byte, len(data))
 	copy(tampered, data)
 	tampered[0] ^= 0xFF
-	if squic.VerifyMAC1(sharedSecret, tampered, ed, ts, nonce, mac) {
+	if squic.VerifyMAC1(squic.EnvelopeV1, sharedSecret, tampered, ed, ts, nonce, mac) {
 		t.Error("MAC1 should fail with tampered data")
 	}
 
@@ -58,19 +58,19 @@ func TestMAC1RoundTrip(t *testing.T) {
 	ed2 := make([]byte, squic.Ed25519Size)
 	copy(ed2, ed)
 	ed2[0] ^= 0xFF
-	if squic.VerifyMAC1(sharedSecret, data, ed2, ts, nonce, mac) {
+	if squic.VerifyMAC1(squic.EnvelopeV1, sharedSecret, data, ed2, ts, nonce, mac) {
 		t.Error("MAC1 should fail with tampered Ed25519 field")
 	}
 
 	// Wrong timestamp should fail
-	if squic.VerifyMAC1(sharedSecret, data, ed, ts+1, nonce, mac) {
+	if squic.VerifyMAC1(squic.EnvelopeV1, sharedSecret, data, ed, ts+1, nonce, mac) {
 		t.Error("MAC1 should fail with different timestamp")
 	}
 
 	// Wrong nonce should fail
 	wrongNonce := make([]byte, squic.NonceSize)
 	rand.Read(wrongNonce)
-	if squic.VerifyMAC1(sharedSecret, data, ed, ts, wrongNonce, mac) {
+	if squic.VerifyMAC1(squic.EnvelopeV1, sharedSecret, data, ed, ts, wrongNonce, mac) {
 		t.Error("MAC1 should fail with different nonce")
 	}
 }
@@ -867,7 +867,7 @@ func TestSmallOrderClientKeyIsRefused(t *testing.T) {
 	ed := make([]byte, squic.Ed25519Size)
 	ts := squic.NowTimestamp()
 	nonce, _ := squic.GenerateNonce()
-	mac1 := squic.ComputeMAC1(assumedShared, datagram, ed, ts, nonce)
+	mac1 := squic.ComputeMAC1(squic.EnvelopeV1, assumedShared, datagram, ed, ts, nonce)
 
 	// The exchange the server would perform. If it yields a usable secret
 	// rather than an error, a stranger's MAC1 verifies.

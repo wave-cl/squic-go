@@ -105,6 +105,26 @@ type Config struct {
 	// the same two states Option::None and Some(0), which it can distinguish.)
 	LoadThreshold int64
 
+	// EnvelopeVersion is the envelope version this client emits (SIP-29).
+	//
+	// Zero means unset and selects EnvelopeV1, deliberately, and *not* the
+	// newest version this package implements. A client that defaulted to the
+	// newest would break every deployment that upgraded a client before a
+	// server — which is exactly the flag day the version marker exists to
+	// remove. Set it to EnvelopeV2 once the servers you talk to accept it; a
+	// later release will move the default.
+	//
+	// Zero is safe as a sentinel here because SIP-29 reserves version 0 and
+	// forbids emitting it, so it can never be a version somebody meant.
+	EnvelopeVersion uint8
+
+	// AcceptedEnvelopeVersions is the set of envelope versions this server
+	// parses (SIP-29). Nil selects both, so a server can be upgraded without
+	// waiting for its clients. Set it to just {EnvelopeV2} to retire version 1
+	// — which a deployment must be able to do, or the oldest envelope ever
+	// defined becomes a permanent floor.
+	AcceptedEnvelopeVersions []uint8
+
 	// QuicConfig allows passing additional quic-go configuration.
 	// If nil, sensible defaults are used. Overrides all other fields.
 	QuicConfig *quic.Config
@@ -181,6 +201,20 @@ func (c *Config) loadThreshold() int64 {
 	return c.LoadThreshold
 }
 
+func (c *Config) envelopeVersion() uint8 {
+	if c == nil || c.EnvelopeVersion == 0 {
+		return EnvelopeV1 // unset; see the field comment for why not the newest
+	}
+	return c.EnvelopeVersion
+}
+
+func (c *Config) acceptedEnvelopeVersions() []uint8 {
+	if c == nil || len(c.AcceptedEnvelopeVersions) == 0 {
+		return []uint8{EnvelopeV1, EnvelopeV2}
+	}
+	return c.AcceptedEnvelopeVersions
+}
+
 func (c *Config) nextProtos() []string {
 	if c != nil && len(c.NextProtos) > 0 {
 		return c.NextProtos
@@ -236,7 +270,7 @@ func Listen(network, addr string, serverCert tls.Certificate, serverPubKey []byt
 	serverX25519Priv := Ed25519PrivateToX25519(edPriv)
 
 	// Wrap with DH MAC1 validation — silent server
-	wrappedConn := newServerConn(rawConn, serverX25519Priv, config.allowedKeys(), config.loadThreshold())
+	wrappedConn := newServerConn(rawConn, serverX25519Priv, config.allowedKeys(), config.loadThreshold(), config.acceptedEnvelopeVersions())
 
 	tlsConf := ServerTLSConfig(serverCert)
 	if protos := config.nextProtos(); protos != nil {
@@ -483,7 +517,7 @@ func Dial(ctx context.Context, addr string, serverPubKey []byte, config *Config)
 	}
 
 	// Wrap with DH MAC1 appending
-	wrappedConn := newClientConn(rawConn, shared, clientPub, advertiseEd25519, CookieKey(serverX25519Pub))
+	wrappedConn := newClientConn(rawConn, shared, clientPub, advertiseEd25519, CookieKey(serverX25519Pub), config.envelopeVersion())
 
 	tlsConf := ClientTLSConfig(serverPubKey)
 	if protos := config.nextProtos(); protos != nil {

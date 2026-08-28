@@ -33,7 +33,7 @@ func TestMAC2CoversTheEnvelopeUpToMAC1(t *testing.T) {
 	ed := make([]byte, Ed25519Size)
 	ts := NowTimestamp()
 	nonce, _ := GenerateNonce()
-	mac1 := ComputeMAC1(shared, datagram, ed, ts, nonce)
+	mac1 := ComputeMAC1(EnvelopeV1, shared, datagram, ed, ts, nonce)
 
 	var buf []byte
 	buf = append(buf, datagram...)
@@ -109,7 +109,7 @@ func TestLoadMonitorRaisesAndClearsUnderLoad(t *testing.T) {
 
 	seed := make([]byte, 32)
 	rand.Read(seed)
-	sc := newServerConn(conn, seed, nil, 5)
+	sc := newServerConn(conn, seed, nil, 5, []uint8{EnvelopeV1, EnvelopeV2})
 
 	if sc.underLoad.Load() {
 		t.Fatal("a server starts under load")
@@ -141,7 +141,7 @@ func TestCookieRotationKeepsOneGenerationOfGrace(t *testing.T) {
 
 	seed := make([]byte, 32)
 	rand.Read(seed)
-	sc := newServerConn(conn, seed, nil, 0) // defence off: no background rotation
+	sc := newServerConn(conn, seed, nil, 0, []uint8{EnvelopeV1, EnvelopeV2}) // defence off: no background rotation
 
 	ip := net.ParseIP("198.51.100.9")
 	current, _ := sc.cookieSecrets()

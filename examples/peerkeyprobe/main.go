@@ -44,13 +44,14 @@ func main() {
 	clientKey := flag.String("client-key", "", "client Ed25519 seed (hex), client mode")
 	advertise := flag.Bool("advertise", false, "advertise the client Ed25519 identity (SIP-3)")
 	underLoad := flag.Bool("under-load", false, "server: demand a cookie from every caller (SIP-7)")
+	envelopeVersion := flag.Int("envelope-version", 1, "client: envelope version to emit (SIP-29)")
 	flag.Parse()
 
 	switch {
 	case *server:
 		runServer(*port, *serverKey, *underLoad)
 	case *client:
-		runClient(*host, *port, *serverPub, *clientKey, *advertise)
+		runClient(*host, *port, *serverPub, *clientKey, *advertise, uint8(*envelopeVersion))
 	default:
 		fmt.Fprintln(os.Stderr, "specify -server or -client")
 		os.Exit(2)
@@ -105,7 +106,7 @@ func runServer(port int, serverKeyHex string, underLoad bool) {
 	}
 }
 
-func runClient(host string, port int, serverPubHex, clientKeyHex string, advertise bool) {
+func runClient(host string, port int, serverPubHex, clientKeyHex string, advertise bool, envelopeVersion uint8) {
 	serverPub, err := hex.DecodeString(serverPubHex)
 	if err != nil {
 		fail("decode server-pub", err)
@@ -122,6 +123,7 @@ func runClient(host string, port int, serverPubHex, clientKeyHex string, adverti
 		fail("convert client key", err)
 	}
 	fmt.Printf("CLIENTX=%s\n", hex.EncodeToString(x))
+	fmt.Printf("CLIENTVER=%d\n", envelopeVersion)
 	if advertise {
 		fmt.Printf("CLIENTED=%s\n", hex.EncodeToString(edPub))
 	} else {
@@ -133,6 +135,7 @@ func runClient(host string, port int, serverPubHex, clientKeyHex string, adverti
 	conn, err := squic.Dial(ctx, fmt.Sprintf("%s:%d", host, port), serverPub, &squic.Config{
 		ClientKey:         clientKeyHex,
 		AdvertiseIdentity: advertise,
+		EnvelopeVersion:   envelopeVersion,
 	})
 	if err != nil {
 		fail("dial", err)

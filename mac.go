@@ -33,10 +33,24 @@ const (
 	// MAC2Size is the size of the MAC2 tag in bytes.
 	MAC2Size = 16
 
-	// MACOverhead is the total overhead appended to Initial packets (SIP-3):
-	// 32-byte client X25519 public key + 32-byte Ed25519 identity + 4-byte
-	// timestamp + 8-byte nonce + 16-byte MAC1 + 16-byte MAC2.
+	// MACOverhead is the total overhead appended to Initial packets by envelope
+	// version 1 (SIP-6): 32-byte client X25519 public key + 32-byte Ed25519
+	// identity + 4-byte timestamp + 8-byte nonce + 16-byte MAC1 + 16-byte MAC2.
 	MACOverhead = ClientKeySize + Ed25519Size + TimestampSize + NonceSize + MACSize + MAC2Size
+
+	// EnvelopeV1 is the envelope of SIP-6: no marker byte on the wire. It is
+	// named so that a receiver supporting both has something to call the
+	// unmarked form.
+	EnvelopeV1 = 1
+
+	// EnvelopeV2 is EnvelopeV1 plus a one-byte version marker, last (SIP-29).
+	EnvelopeV2 = 2
+
+	// VersionSize is the width of the version marker.
+	VersionSize = 1
+
+	// MACOverheadV2 is the trailer width for envelope version 2.
+	MACOverheadV2 = MACOverhead + VersionSize
 
 	// CookieReplyType is the first byte of a cookie reply packet.
 	// Distinguishes from QUIC packets (Initial starts with 0xC0+).
@@ -50,16 +64,43 @@ const (
 	ReplayWindow = 120 * time.Second
 )
 
+// TrailerLen returns the trailer width for an envelope version, and false if
+// the version is unknown.
+//
+// SIP-29: version 0 is reserved and never emitted, so a zero byte is known not
+// to be a marker.
+func TrailerLen(version uint8) (int, bool) {
+	switch version {
+	case EnvelopeV1:
+		return MACOverhead, true
+	case EnvelopeV2:
+		return MACOverheadV2, true
+	default:
+		return 0, false
+	}
+}
+
 // ComputeMAC1 computes a MAC1 tag with a timestamp and nonce for replay protection.
-// MAC1 = HMAC-SHA256(sharedSecret, data || ed25519 || timestamp || nonce)[:16]
+// MAC1 = HMAC-SHA256(sharedSecret, [version ||] data || ed25519 || timestamp || nonce)[:16]
 //
 // SIP-3: the carried Ed25519 identity field is part of the MAC1 input (it does
 // not feed the shared secret, so leaving it unauthenticated would let an on-path
 // attacker substitute the sign-conjugate key and flip the reported identity).
 // ed25519 is the 32-byte field exactly as it appears on the wire (all zeros when
 // no identity is asserted).
-func ComputeMAC1(sharedSecret []byte, data []byte, ed25519 []byte, timestamp uint32, nonce []byte) []byte {
+//
+// SIP-29: every marked version prefixes its version byte; version 1 predates the
+// marker and prefixes nothing. A prefix rather than a suffix, because it is doing
+// two jobs. It authenticates the marker, which a receiver has to read before it
+// can verify anything. And because it comes first, tags computed under different
+// versions are unrelated even when the remaining input coincides — so a packet
+// valid under one version can never verify under another, whatever an attacker
+// picks for the rest of the envelope.
+func ComputeMAC1(version uint8, sharedSecret []byte, data []byte, ed25519 []byte, timestamp uint32, nonce []byte) []byte {
 	mac := hmac.New(sha256.New, sharedSecret)
+	if version != EnvelopeV1 {
+		mac.Write([]byte{version})
+	}
 	mac.Write(data)
 	mac.Write(ed25519)
 	var ts [4]byte
@@ -71,8 +112,8 @@ func ComputeMAC1(sharedSecret []byte, data []byte, ed25519 []byte, timestamp uin
 
 // VerifyMAC1 checks a MAC1 tag against data, the ed25519 field, timestamp,
 // nonce, and shared secret.
-func VerifyMAC1(sharedSecret []byte, data []byte, ed25519 []byte, timestamp uint32, nonce []byte, mac1 []byte) bool {
-	expected := ComputeMAC1(sharedSecret, data, ed25519, timestamp, nonce)
+func VerifyMAC1(version uint8, sharedSecret []byte, data []byte, ed25519 []byte, timestamp uint32, nonce []byte, mac1 []byte) bool {
+	expected := ComputeMAC1(version, sharedSecret, data, ed25519, timestamp, nonce)
 	return subtle.ConstantTimeCompare(mac1, expected) == 1
 }
 

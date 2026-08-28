@@ -42,7 +42,7 @@ func TestZeroThresholdStartsNoCookieMachinery(t *testing.T) {
 	priv := make([]byte, 32)
 	copy(priv, pub)
 
-	sc := newServerConn(nil, priv, nil, 0)
+	sc := newServerConn(nil, priv, nil, 0, []uint8{EnvelopeV1, EnvelopeV2})
 	if sc.loadThreshold != 0 {
 		t.Fatalf("loadThreshold = %d, want 0", sc.loadThreshold)
 	}
@@ -75,7 +75,7 @@ func TestAnswerChallengeRetransmitsImmediately(t *testing.T) {
 
 	var cookieKey [32]byte
 	rand.Read(cookieKey[:])
-	c := newClientConn(local, make([]byte, 32), make([]byte, 32), nil, cookieKey)
+	c := newClientConn(local, make([]byte, 32), make([]byte, 32), nil, cookieKey, EnvelopeV1)
 
 	// A cookie arriving before anything has been sent must not panic and must
 	// not invent a packet.

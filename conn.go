@@ -144,6 +144,7 @@ type clientConn struct {
 	sharedSecret     []byte           // X25519(clientPriv, serverPub)
 	clientPubKey     []byte           // 32-byte X25519 public key
 	advertiseEd25519 []byte           // SIP-3: 32-byte Ed25519 identity to assert, or 32 zero bytes
+	envelopeVersion  uint8            // SIP-29: the envelope version this client emits
 	cookieKey        [32]byte         // decrypts cookie replies; derived from the server's public key
 	handshakeDone    atomic.Bool      // true after first non-cookie packet; skips the cookie scan
 	cookie           atomic.Value     // decrypted 16-byte cookie from the server, keys MAC2
@@ -159,7 +160,7 @@ type sentInitial struct {
 	addr     *net.UDPAddr
 }
 
-func newClientConn(conn *net.UDPConn, sharedSecret, clientX25519Pub, advertiseEd25519 []byte, cookieKey [32]byte) *clientConn {
+func newClientConn(conn *net.UDPConn, sharedSecret, clientX25519Pub, advertiseEd25519 []byte, cookieKey [32]byte, envelopeVersion uint8) *clientConn {
 	// Always a 32-byte field so the client's MAC1 input and the bytes on the
 	// wire match what the server reads and hashes (all zeros = no identity).
 	if len(advertiseEd25519) != Ed25519Size {
@@ -170,6 +171,7 @@ func newClientConn(conn *net.UDPConn, sharedSecret, clientX25519Pub, advertiseEd
 		sharedSecret:     sharedSecret,
 		clientPubKey:     clientX25519Pub,
 		advertiseEd25519: advertiseEd25519,
+		envelopeVersion:  envelopeVersion,
 		cookieKey:        cookieKey,
 	}
 }
@@ -358,9 +360,13 @@ func (c *clientConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 func (c *clientConn) buildInitial(p []byte) []byte {
 	ts := NowTimestamp()
 	nonce, _ := GenerateNonce()
-	mac1 := ComputeMAC1(c.sharedSecret, p, c.advertiseEd25519, ts, nonce)
+	mac1 := ComputeMAC1(c.envelopeVersion, c.sharedSecret, p, c.advertiseEd25519, ts, nonce)
 
-	buf := make([]byte, len(p)+MACOverhead)
+	trailer, ok := TrailerLen(c.envelopeVersion)
+	if !ok {
+		trailer = MACOverhead
+	}
+	buf := make([]byte, len(p)+trailer)
 	copy(buf, p)
 	off := len(p)
 	copy(buf[off:], c.clientPubKey)
@@ -384,6 +390,15 @@ func (c *clientConn) buildInitial(p []byte) []byte {
 		copy(buf[off:], mac2)
 	}
 	// else: MAC2 field is already zeros from make()
+	off += MAC2Size
+
+	// SIP-29: the marker goes last, after MAC2, because that is the only offset
+	// a receiver can find without already knowing the trailer's width. Version 1
+	// predates it and emits nothing, which is what keeps this client able to
+	// talk to a server that has not moved yet.
+	if c.envelopeVersion != EnvelopeV1 {
+		buf[off] = c.envelopeVersion
+	}
 
 	return buf
 }
@@ -431,6 +446,7 @@ type serverConn struct {
 	cookieReplies    atomic.Int64 // challenges issued since start
 	mac2Verified     atomic.Int64 // Initials admitted on a valid MAC2
 	loadThreshold    int64        // DH/sec before entering under-load mode
+	acceptedVersions []uint8      // SIP-29: envelope versions this server parses
 
 	// peers maps DCID -> MAC1-verified peer key, drained by the application at
 	// accept via the ConnContext/Tracer bridge in Listen. See SIP-2.
@@ -444,11 +460,12 @@ func (c *serverConn) cookieSecrets() (current, previous [32]byte) {
 	return c.cookieSecret, c.prevCookieSecret
 }
 
-func newServerConn(conn *net.UDPConn, serverX25519Priv []byte, allowedKeys [][]byte, loadThreshold int64) *serverConn {
+func newServerConn(conn *net.UDPConn, serverX25519Priv []byte, allowedKeys [][]byte, loadThreshold int64, acceptedVersions []uint8) *serverConn {
 	sc := &serverConn{
 		conn:             conn,
 		serverX25519Priv: serverX25519Priv,
 		loadThreshold:    loadThreshold,
+		acceptedVersions: acceptedVersions,
 		peers:            newPeerTable(),
 	}
 
@@ -632,18 +649,83 @@ func (c *serverConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 // validateAndStrip checks if the packet is valid and strips MAC overhead from Initial packets.
 // Returns (true, newLength) if valid, (false, 0) if should be dropped.
 // addr is used to send cookie replies when under load (can be nil to skip).
+// outcome is what one envelope-version attempt concluded (SIP-29).
+//
+// challengeNeeded is reported rather than acted on, so that trying two layouts
+// for one datagram cannot send the caller two cookie replies.
+type outcome int
+
+const (
+	outcomeDrop outcome = iota
+	outcomeChallenge
+	outcomeAccepted
+)
+
+// validateAndStrip dispatches an Initial on its envelope version (SIP-29) and
+// validates it. Returns (true, newLength) if valid, (false, 0) to drop.
+//
+// The version marker is the last byte of the datagram, which is the only place
+// a receiver can read without already knowing the trailer's width — and knowing
+// the width is what the marker is for. Version 1 predates the marker and carries
+// none, so it is the fallback: its last byte is the last byte of MAC2, uniformly
+// random, and names version 2 about once in 256 packets. That costs one wasted
+// parse before the fallback succeeds, and nothing for the other 255.
+//
+// addr is used to send cookie replies when under load (can be nil to skip).
 func (c *serverConn) validateAndStrip(p []byte, n int, addr *net.UDPAddr) (bool, int) {
 	// Non-Initial packets pass through unmodified
 	if !isQUICInitial(p[:n]) {
 		return true, n
 	}
 
-	// Initial packet: must have client pubkey + MAC1 + MAC2 appended
-	if n <= MACOverhead {
-		return false, 0
+	marked := p[n-1]
+	challenge := false
+
+	// A marked version, if we accept it and it is not the unmarked one.
+	if marked != EnvelopeV1 && c.accepts(marked) {
+		switch res, quicLen := c.tryVersion(marked, p, n, addr); res {
+		case outcomeAccepted:
+			return true, quicLen
+		case outcomeChallenge:
+			challenge = true
+		}
 	}
 
-	quicLen := n - MACOverhead
+	// Then the unmarked form, which is the only version that needs guessing.
+	if c.accepts(EnvelopeV1) {
+		switch res, quicLen := c.tryVersion(EnvelopeV1, p, n, addr); res {
+		case outcomeAccepted:
+			return true, quicLen
+		case outcomeChallenge:
+			challenge = true
+		}
+	}
+
+	// At most one challenge per datagram, however many layouts were tried.
+	if challenge && addr != nil {
+		c.sendCookieReply(addr)
+	}
+	return false, 0
+}
+
+// accepts reports whether this server parses the given envelope version.
+func (c *serverConn) accepts(version uint8) bool {
+	for _, v := range c.acceptedVersions {
+		if v == version {
+			return true
+		}
+	}
+	return false
+}
+
+// tryVersion validates one Initial under one envelope version.
+func (c *serverConn) tryVersion(version uint8, p []byte, n int, addr *net.UDPAddr) (outcome, int) {
+	trailer, known := TrailerLen(version)
+	if !known || n <= trailer {
+		return outcomeDrop, 0
+	}
+
+	quicLen := n - trailer
 	off := quicLen
 	clientPub := p[off : off+ClientKeySize]
 	off += ClientKeySize
@@ -656,12 +738,12 @@ func (c *serverConn) validateAndStrip(p []byte, n int, addr *net.UDPAddr) (bool,
 	mac1Start := off
 	mac1 := p[off : off+MACSize]
 	off += MACSize
-	mac2 := p[off:n]
+	mac2 := p[off : off+MAC2Size]
 	timestamp := binary.BigEndian.Uint32(tsBytes)
 
 	// Step 1: Replay protection — reject timestamps outside window (cheap)
 	if !TimestampInWindow(timestamp, NowTimestamp()) {
-		return false, 0
+		return outcomeDrop, 0
 	}
 
 	// Step 2: MAC2 check — if under load, require valid MAC2
@@ -694,11 +776,7 @@ func (c *serverConn) validateAndStrip(p []byte, n int, addr *net.UDPAddr) (bool,
 		if mac2Valid {
 			c.mac2Verified.Add(1)
 		} else {
-			// Under load with no valid MAC2 — send cookie reply and drop
-			if addr != nil {
-				c.sendCookieReply(addr)
-			}
-			return false, 0
+			return outcomeChallenge, 0
 		}
 	}
 
@@ -710,7 +788,7 @@ func (c *serverConn) validateAndStrip(p []byte, n int, addr *net.UDPAddr) (bool,
 		var key [32]byte
 		copy(key[:], clientPub)
 		if !keys[key] {
-			return false, 0
+			return outcomeDrop, 0
 		}
 	}
 
@@ -718,13 +796,18 @@ func (c *serverConn) validateAndStrip(p []byte, n int, addr *net.UDPAddr) (bool,
 	c.dhCount.Add(1)
 	shared, dhErr := X25519(c.serverX25519Priv, clientPub)
 	if dhErr != nil {
-		return false, 0
+		return outcomeDrop, 0
 	}
 
-	if !VerifyMAC1(shared, p[:quicLen], edField, timestamp, nonce, mac1) {
-		return false, 0
+	if !VerifyMAC1(version, shared, p[:quicLen], edField, timestamp, nonce, mac1) {
+		return outcomeDrop, 0
 	}
 
+	// MAC1 holds, and it covers the version marker, which SIP-29 prefixes to
+	// its input — a peer that tampered with the marker produces a tag over a
+	// different layout, which is why a flipped marker can only cost a drop and
+	// never an accept.
+	//
 	// SIP-3: if the caller asserted an Ed25519 identity (nonzero field), it must
 	// forward-derive to the X25519 key MAC1 just proved. The map runs this way
 	// even though it does not run backwards; the caller states which key is its
@@ -746,22 +829,21 @@ func (c *serverConn) validateAndStrip(p []byte, n int, addr *net.UDPAddr) (bool,
 	if !edZero {
 		derived, edErr := Ed25519IdentityToX25519(edField)
 		if edErr != nil || subtle.ConstantTimeCompare(derived, clientPub) != 1 {
-			return false, 0
+			return outcomeDrop, 0
 		}
 		copy(identity[:], edField)
 		hasIdentity = true
 	}
 
-	// MAC1 holds: the caller possesses the private key for clientPub (SIP-2), and
-	// the Ed25519 field is authenticated. Record both against the Initial's DCID
-	// so the application can recover the peer at accept (SIP-2 key, SIP-3 id).
+	// Record both against the Initial's DCID so the application can recover the
+	// peer at accept (SIP-2 key, SIP-3 id).
 	if dcid, ok := initialDCID(p[:quicLen]); ok {
 		var key [32]byte
 		copy(key[:], clientPub)
 		c.peers.record(dcid, key, identity, hasIdentity, time.Now())
 	}
 
-	return true, quicLen
+	return outcomeAccepted, quicLen
 }
 
 // addKey adds a client public key to the whitelist.

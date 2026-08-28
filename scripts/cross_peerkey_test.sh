@@ -33,11 +33,12 @@ SERVER_SEED="1111111111111111111111111111111111111111111111111111111111111111"
 CLIENT_SEED="2222222222222222222222222222222222222222222222222222222222222222"
 pass=0; fail=0; port=5300
 
-run() { # $1=server label $2=server bin  $3=client label $4=client bin  $5=advertise(0|1)
+run() { # $1=server label $2=server bin  $3=client label $4=client bin  $5=advertise(0|1)  $6=envelope version
   port=$((port+1))
   local adv_flag="" adv_label="anon"
   if [ "$5" = "1" ]; then adv_flag="--advertise"; adv_label="advertised"; fi
-  local so="$WORK/s_$1_$3_$5.out" co="$WORK/c_$1_$3_$5.out"
+  local ver="${6:-1}"
+  local so="$WORK/s_$1_$3_$5_$ver.out" co="$WORK/c_$1_$3_$5_$ver.out"
   "$2" --server --port "$port" --server-key "$SERVER_SEED" >"$so" 2>"$so.err" &
   local spid=$!
   local pub=""
@@ -51,7 +52,8 @@ run() { # $1=server label $2=server bin  $3=client label $4=client bin  $5=adver
     kill "$spid" 2>/dev/null; fail=$((fail+1)); return
   fi
   # shellcheck disable=SC2086 # adv_flag is one optional literal flag
-  "$4" --client --host 127.0.0.1 --port "$port" --server-pub "$pub" --client-key "$CLIENT_SEED" $adv_flag >"$co" 2>"$co.err"
+  "$4" --client --host 127.0.0.1 --port "$port" --server-pub "$pub" --client-key "$CLIENT_SEED" \
+    --envelope-version "$ver" $adv_flag >"$co" 2>"$co.err"
   for _ in $(seq 1 30); do grep -q PEERID "$so" && break; sleep 0.1; done
   kill "$spid" 2>/dev/null; wait "$spid" 2>/dev/null
   local pk cx pid ced
@@ -60,10 +62,10 @@ run() { # $1=server label $2=server bin  $3=client label $4=client bin  $5=adver
   pid=$(grep -oE 'PEERID=[0-9a-f]+|PEERID=none' "$so" | head -1 | cut -d= -f2)
   ced=$(grep -oE 'CLIENTED=[0-9a-f]+|CLIENTED=none' "$co" | head -1 | cut -d= -f2)
   if [ -n "$pk" ] && [ "$pk" = "$cx" ] && [ -n "$pid" ] && [ "$pid" = "$ced" ]; then
-    echo "  [$1 server / $3 client / $adv_label] PASS  peer=${pk:0:16}… id=${pid:0:16}…"
+    echo "  [$1 server / $3 client / $adv_label / envelope v$ver] PASS  peer=${pk:0:16}…"
     pass=$((pass+1))
   else
-    echo "  [$1 server / $3 client / $adv_label] FAIL"
+    echo "  [$1 server / $3 client / $adv_label / envelope v$ver] FAIL"
     echo "      PEERKEY=$pk CLIENTX=$cx"
     echo "      PEERID=$pid CLIENTED=$ced"
     [ -s "$so.err" ] && sed 's/^/    s.err: /' "$so.err" | head -3
@@ -72,12 +74,19 @@ run() { # $1=server label $2=server bin  $3=client label $4=client bin  $5=adver
   fi
 }
 
-echo "=== cross-implementation SIP-2 peer-key / SIP-3 peer-identity test ==="
-for adv in 0 1; do
-  run rust "$RUST" rust "$RUST" "$adv"
-  run rust "$RUST" go   "$GO"   "$adv"
-  run go   "$GO"   rust "$RUST" "$adv"
-  run go   "$GO"   go   "$GO"   "$adv"
+# The envelope version dimension is SIP-29's. Every server here accepts both
+# versions, which is the transition state the SIP exists to make possible, so
+# the version 1 rows prove an old client still reaches a new server across the
+# implementation boundary, and the version 2 rows prove the two agree on the
+# marker's position and on the version-prefixed MAC1.
+echo "=== cross-implementation SIP-2 peer-key / SIP-3 peer-identity / SIP-29 envelope test ==="
+for ver in 1 2; do
+  for adv in 0 1; do
+    run rust "$RUST" rust "$RUST" "$adv" "$ver"
+    run rust "$RUST" go   "$GO"   "$adv" "$ver"
+    run go   "$GO"   rust "$RUST" "$adv" "$ver"
+    run go   "$GO"   go   "$GO"   "$adv" "$ver"
+  done
 done
 echo "=== pass=$pass fail=$fail ==="
 rm -rf "$WORK"
