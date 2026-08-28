@@ -25,6 +25,13 @@ func isQUICInitial(data []byte) bool {
 	return data[0]&0xF0 == 0xC0
 }
 
+// isShortHeader reports whether a packet has a QUIC short header: header-form
+// bit clear, fixed bit set. Everything after the handshake looks like this and
+// nothing before it does.
+func isShortHeader(data []byte) bool {
+	return len(data) > 0 && data[0]&0xC0 == 0x40
+}
+
 // peerKeyTTL bounds how long a validated peer key is retained before the
 // connection is accepted. An Initial that passes MAC1 but whose handshake
 // never completes would otherwise leave its key indefinitely; a peer that can
@@ -222,7 +229,6 @@ func (c *clientConn) ReadFrom(b []byte) (int, net.Addr, error) {
 			c.storeCookie(b[1:n])
 			continue
 		}
-		c.handshakeDone.Store(true)
 		return n, addr, nil
 	}
 }
@@ -237,7 +243,24 @@ func (c *clientConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if isQUICInitial(p) {
 		return c.writeInitial(p, addr.(*net.UDPAddr))
 	}
+	c.armFastPath(p)
 	return c.conn.WriteTo(p, addr)
+}
+
+// armFastPath stops the read paths looking for cookie replies, once there can
+// no longer be one to find.
+//
+// A short header means 1-RTT keys, which means the handshake finished — and
+// only an Initial is ever challenged, so no cookie can follow. Arming this on
+// the read side instead, at the first packet that was not a cookie, was wrong:
+// the server's very first packet back clears it, and a server that then enters
+// under-load mode mid-handshake challenges an Initial whose reply the client
+// has stopped reading. The connection stalls until it times out, and only a
+// fresh attempt recovers.
+func (c *clientConn) armFastPath(p []byte) {
+	if isShortHeader(p) {
+		c.handshakeDone.Store(true)
+	}
 }
 
 func (c *clientConn) Close() error                       { return c.conn.Close() }
@@ -271,7 +294,6 @@ func (c *clientConn) ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UD
 			c.storeCookie(b[1:n])
 			continue
 		}
-		c.handshakeDone.Store(true)
 		return
 	}
 }
@@ -281,6 +303,7 @@ func (c *clientConn) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int,
 	if isQUICInitial(b) {
 		return c.writeInitialMsg(b, oob, addr)
 	}
+	c.armFastPath(b)
 	return c.conn.WriteMsgUDP(b, oob, addr)
 }
 
@@ -322,7 +345,6 @@ func (c *clientConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	}
 
 	if !sawCookie {
-		c.handshakeDone.Store(true)
 		return n, nil
 	}
 	if valid == 0 {

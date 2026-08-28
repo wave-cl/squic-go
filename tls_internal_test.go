@@ -135,3 +135,28 @@ func containsBytes(haystack, needle []byte) bool {
 	}
 	return false
 }
+
+// The client stops watching for cookie replies when it sends its first 1-RTT
+// packet, so this classification decides when that happens. Getting it wrong in
+// one direction leaves the fast path permanently disarmed; in the other it
+// disarms the cookie path during the handshake, which is the stall the move to
+// the write side was made to fix.
+func TestShortHeaderClassification(t *testing.T) {
+	if !isShortHeader([]byte{0x40}) || !isShortHeader([]byte{0x7f}) {
+		t.Fatal("1-RTT packets must be short-header")
+	}
+	for _, first := range []byte{0xc0, 0xd0, 0xe0, 0xf0} {
+		if isShortHeader([]byte{first}) {
+			t.Fatalf("long header %#02x classified as short", first)
+		}
+	}
+	if isShortHeader([]byte{CookieReplyType}) {
+		t.Fatal("a cookie reply must not look like a 1-RTT packet")
+	}
+	if isQUICInitial([]byte{CookieReplyType, 0, 0, 0, 0}) {
+		t.Fatal("a cookie reply must not look like an Initial")
+	}
+	if isShortHeader([]byte{0x00}) || isShortHeader(nil) {
+		t.Fatal("fixed bit clear is not a QUIC packet")
+	}
+}
