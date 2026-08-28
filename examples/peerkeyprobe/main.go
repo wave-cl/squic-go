@@ -11,6 +11,11 @@
 //	as CLIENTX=<hex>, plus the Ed25519 identity it advertises as
 //	CLIENTED=<hex> — or CLIENTED=none without -advertise.
 //
+// With -under-load the server demands a cookie (SIP-7) from every caller before
+// doing any key agreement, and reports the defence's counters as
+// COOKIES=<replies sent>,<MAC2 verified>, so a harness can tell a connection
+// that went through the cookie exchange from one that merely succeeded.
+//
 // A harness runs this against the Rust probe in every client/server
 // combination and asserts every PEERKEY equals every CLIENTX, and every PEERID
 // equals every CLIENTED (covering both the advertised and anonymous cases).
@@ -38,11 +43,12 @@ func main() {
 	serverPub := flag.String("server-pub", "", "server Ed25519 public key (hex), client mode")
 	clientKey := flag.String("client-key", "", "client Ed25519 seed (hex), client mode")
 	advertise := flag.Bool("advertise", false, "advertise the client Ed25519 identity (SIP-3)")
+	underLoad := flag.Bool("under-load", false, "server: demand a cookie from every caller (SIP-7)")
 	flag.Parse()
 
 	switch {
 	case *server:
-		runServer(*port, *serverKey)
+		runServer(*port, *serverKey, *underLoad)
 	case *client:
 		runClient(*host, *port, *serverPub, *clientKey, *advertise)
 	default:
@@ -56,7 +62,7 @@ func fail(msg string, err error) {
 	os.Exit(1)
 }
 
-func runServer(port int, serverKeyHex string) {
+func runServer(port int, serverKeyHex string, underLoad bool) {
 	cert, pubKey, err := squic.LoadKeyPair(serverKeyHex)
 	if err != nil {
 		fail("load server key", err)
@@ -67,6 +73,9 @@ func runServer(port int, serverKeyHex string) {
 		fail("listen", err)
 	}
 	defer ln.Close()
+	if underLoad {
+		ln.SetUnderLoad(true)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -84,6 +93,8 @@ func runServer(port int, serverKeyHex string) {
 	} else {
 		fmt.Println("PEERID=none")
 	}
+	stats := ln.LoadStats()
+	fmt.Printf("COOKIES=%d,%d\n", stats.CookieRepliesSent, stats.MAC2Verified)
 	// Complete the exchange so the client does not error.
 	stream, err := conn.AcceptStream(ctx)
 	if err == nil {
