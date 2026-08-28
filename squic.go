@@ -107,12 +107,15 @@ type Config struct {
 
 	// EnvelopeVersion is the envelope version this client emits (SIP-29).
 	//
-	// Zero means unset and selects EnvelopeV1, deliberately, and *not* the
-	// newest version this package implements. A client that defaulted to the
-	// newest would break every deployment that upgraded a client before a
-	// server — which is exactly the flag day the version marker exists to
-	// remove. Set it to EnvelopeV2 once the servers you talk to accept it; a
-	// later release will move the default.
+	// Zero means unset and selects EnvelopeV2 as of v0.63.0. It selected
+	// EnvelopeV1 in v0.62.0, which is the discipline SIP-29 requires — a
+	// release that introduces a version ships clients still sending the
+	// previous one, so that upgrading a client before a server cannot break
+	// anything, and a later release moves the default once servers have had
+	// time to deploy. This is that later release.
+	//
+	// Set it to EnvelopeV1 if you still talk to a server older than squic-go
+	// v0.62.0, which will drop a version 2 Initial in silence.
 	//
 	// Zero is safe as a sentinel here because SIP-29 reserves version 0 and
 	// forbids emitting it, so it can never be a version somebody meant.
@@ -203,7 +206,7 @@ func (c *Config) loadThreshold() int64 {
 
 func (c *Config) envelopeVersion() uint8 {
 	if c == nil || c.EnvelopeVersion == 0 {
-		return EnvelopeV1 // unset; see the field comment for why not the newest
+		return EnvelopeV2 // unset; see the field comment for the history
 	}
 	return c.EnvelopeVersion
 }

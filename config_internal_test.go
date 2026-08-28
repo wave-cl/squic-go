@@ -114,3 +114,26 @@ func TestAnswerChallengeRetransmitsImmediately(t *testing.T) {
 		t.Fatal("resent datagram is not an Initial")
 	}
 }
+
+// SIP-29's Sending rule in two parts. A release that introduces a version ships
+// clients still sending the previous one, so upgrading a client before a server
+// cannot break anything; a later release moves the default once servers have
+// deployed. This is that later release, so the default is version 2 — and a
+// server still accepts version 1, because retiring it is a separate decision a
+// deployment makes for itself.
+func TestClientDefaultIsVersion2AndServersStillAcceptVersion1(t *testing.T) {
+	for _, cfg := range []*Config{nil, {}} {
+		if got := cfg.envelopeVersion(); got != EnvelopeV2 {
+			t.Fatalf("client default = %d, want %d", got, EnvelopeV2)
+		}
+		accepted := cfg.acceptedEnvelopeVersions()
+		var sawV1, sawV2 bool
+		for _, v := range accepted {
+			sawV1 = sawV1 || v == EnvelopeV1
+			sawV2 = sawV2 || v == EnvelopeV2
+		}
+		if !sawV1 || !sawV2 {
+			t.Fatalf("server default accepts %v, want both versions", accepted)
+		}
+	}
+}
