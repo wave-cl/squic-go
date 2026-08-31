@@ -1,10 +1,12 @@
 package squic
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"github.com/quic-go/quic-go"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -313,5 +315,53 @@ func TestRepeatedCookieEarnsNoFurtherAnswer(t *testing.T) {
 	peer.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 	if n, _, err := peer.ReadFromUDP(buf); err == nil {
 		t.Errorf("a cookie we already held bought another %d-byte Initial", n)
+	}
+}
+
+// An envelope version nobody defines used to write the marker one byte past a
+// buffer sized without room for it — a panic on the client's first Initial,
+// from a config typo. Dial refuses it now, and buildInitial cannot be reached
+// with one; if it ever were, it falls back to version 1 whole rather than to
+// version 1's width with a version 3 marker.
+func TestUnknownEnvelopeVersionDoesNotPanic(t *testing.T) {
+	local, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+
+	var cookieKey, mac0Key [32]byte
+	rand.Read(cookieKey[:])
+	rand.Read(mac0Key[:])
+
+	for _, v := range []uint8{0, 4, 7, 255} {
+		c := newClientConn(local, make([]byte, 32), make([]byte, 32), nil,
+			local.LocalAddr().(*net.UDPAddr), mac0Key, cookieKey, v)
+		datagram := make([]byte, 1200)
+		datagram[0] = 0xC0
+		binary.BigEndian.PutUint32(datagram[1:5], uint32(quic.Version1))
+
+		buf := c.buildInitial(datagram) // must not panic
+		if want := len(datagram) + MACOverhead; len(buf) != want {
+			t.Errorf("version %d: built %d bytes, want %d (the version 1 envelope)", v, len(buf), want)
+		}
+	}
+}
+
+// And Dial says so plainly rather than letting it become a handshake timeout.
+func TestDialRejectsAnUnknownEnvelopeVersion(t *testing.T) {
+	_, pubKey, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err = Dial(ctx, "127.0.0.1:1", pubKey, &Config{EnvelopeVersion: 9})
+	if err == nil {
+		t.Fatal("Dial accepted an undefined envelope version")
+	}
+	if !strings.Contains(err.Error(), "unknown EnvelopeVersion") {
+		t.Errorf("error does not name the cause: %v", err)
 	}
 }

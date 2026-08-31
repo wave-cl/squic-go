@@ -486,6 +486,17 @@ func Dial(ctx context.Context, addr string, serverPubKey []byte, config *Config)
 		return nil, fmt.Errorf("squic: listen: %w", err)
 	}
 
+	// Reject an envelope version nobody defines, here, where the caller can
+	// see it. Left to run it produces an envelope every server drops, so the
+	// symptom is a handshake timeout with no hint of the cause — and before
+	// buildInitial was hardened it was an out-of-range panic on the first
+	// Initial.
+	if _, ok := TrailerLen(config.envelopeVersion()); !ok {
+		rawConn.Close()
+		return nil, fmt.Errorf("squic: unknown EnvelopeVersion %d (defined: %d, %d, %d)",
+			config.envelopeVersion(), EnvelopeV1, EnvelopeV2, EnvelopeV3)
+	}
+
 	// Convert server Ed25519 pubkey to X25519 for DH
 	serverX25519Pub, err := Ed25519PublicToX25519(serverPubKey)
 	if err != nil {

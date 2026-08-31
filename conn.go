@@ -523,12 +523,21 @@ func (c *clientConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 func (c *clientConn) buildInitial(p []byte) []byte {
 	ts := NowTimestamp()
 	nonce, _ := GenerateNonce()
-	mac1 := ComputeMAC1(c.envelopeVersion, c.sharedSecret, p, c.advertiseEd25519, ts, nonce)
 
-	trailer, ok := TrailerLen(c.envelopeVersion)
+	// An unknown version has no defined trailer. Dial refuses one before a
+	// clientConn is ever built, so this is unreachable — but the old fallback
+	// took version 1's width (108) and then wrote the marker at offset 108
+	// anyway, one past the end of a buffer sized for it, which is a panic
+	// rather than a bad packet. Fall back to version 1 *entirely*, marker
+	// included, so the worst case is an envelope a server will drop.
+	version := c.envelopeVersion
+	trailer, ok := TrailerLen(version)
 	if !ok {
+		version = EnvelopeV1
 		trailer = MACOverhead
 	}
+	mac1 := ComputeMAC1(version, c.sharedSecret, p, c.advertiseEd25519, ts, nonce)
+
 	buf := make([]byte, len(p)+trailer)
 	copy(buf, p)
 	off := len(p)
@@ -543,8 +552,8 @@ func (c *clientConn) buildInitial(p []byte) []byte {
 
 	// MAC0 (v3): computed over exactly the bytes written so far, which is the
 	// contiguous range the server hashes.
-	if HasMAC0(c.envelopeVersion) {
-		copy(buf[off:], ComputeMAC0(c.envelopeVersion, c.mac0Key, buf[:off]))
+	if HasMAC0(version) {
+		copy(buf[off:], ComputeMAC0(version, c.mac0Key, buf[:off]))
 		off += MAC0Size
 	}
 
@@ -567,8 +576,8 @@ func (c *clientConn) buildInitial(p []byte) []byte {
 	// a receiver can find without already knowing the trailer's width. Version 1
 	// predates it and emits nothing, which is what keeps this client able to
 	// talk to a server that has not moved yet.
-	if c.envelopeVersion != EnvelopeV1 {
-		buf[off] = c.envelopeVersion
+	if version != EnvelopeV1 {
+		buf[off] = version
 	}
 
 	return buf
