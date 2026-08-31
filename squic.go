@@ -532,7 +532,7 @@ func Dial(ctx context.Context, addr string, serverPubKey []byte, config *Config)
 	}
 
 	// Wrap with DH MAC1 appending
-	wrappedConn := newClientConn(rawConn, shared, clientPub, advertiseEd25519,
+	wrappedConn := newClientConn(rawConn, shared, clientPub, advertiseEd25519, udpAddr,
 		MAC0Key(serverX25519Pub), CookieKey(serverX25519Pub), config.envelopeVersion())
 
 	tlsConf := ClientTLSConfig(serverPubKey)

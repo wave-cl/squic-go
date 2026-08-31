@@ -1,6 +1,7 @@
 package squic
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/binary"
@@ -257,6 +258,7 @@ type clientConn struct {
 	clientPubKey     []byte           // 32-byte X25519 public key
 	advertiseEd25519 []byte           // SIP-3: 32-byte Ed25519 identity to assert, or 32 zero bytes
 	envelopeVersion  uint8            // SIP-29: the envelope version this client emits
+	serverAddr       *net.UDPAddr     // the address dialled; a cookie reply from anywhere else is not ours
 	mac0Key          [32]byte         // keys MAC0 (envelope v3); derived from the server's public key
 	cookieKey        [32]byte         // decrypts cookie replies; derived from the server's public key
 	handshakeDone    atomic.Bool      // true after first non-cookie packet; skips the cookie scan
@@ -264,6 +266,10 @@ type clientConn struct {
 	// The most recent Initial datagram and where it went, so a cookie
 	// challenge can be answered immediately rather than at the next PTO.
 	lastInitial atomic.Value // holds sentInitial
+	// answered reports whether the current Initial has already had a challenge
+	// answered for it. One answer per Initial sent, which is what bounds the
+	// work an injected cookie reply can buy.
+	answered atomic.Bool
 }
 
 // sentInitial is the last Initial datagram written, kept so a cookie challenge
@@ -273,7 +279,7 @@ type sentInitial struct {
 	addr     *net.UDPAddr
 }
 
-func newClientConn(conn *net.UDPConn, sharedSecret, clientX25519Pub, advertiseEd25519 []byte, mac0Key, cookieKey [32]byte, envelopeVersion uint8) *clientConn {
+func newClientConn(conn *net.UDPConn, sharedSecret, clientX25519Pub, advertiseEd25519 []byte, serverAddr *net.UDPAddr, mac0Key, cookieKey [32]byte, envelopeVersion uint8) *clientConn {
 	// Always a 32-byte field so the client's MAC1 input and the bytes on the
 	// wire match what the server reads and hashes (all zeros = no identity).
 	if len(advertiseEd25519) != Ed25519Size {
@@ -285,6 +291,7 @@ func newClientConn(conn *net.UDPConn, sharedSecret, clientX25519Pub, advertiseEd
 		clientPubKey:     clientX25519Pub,
 		advertiseEd25519: advertiseEd25519,
 		envelopeVersion:  envelopeVersion,
+		serverAddr:       serverAddr,
 		mac0Key:          mac0Key,
 		cookieKey:        cookieKey,
 	}
@@ -300,9 +307,37 @@ func (c *clientConn) storeCookie(payload []byte) bool {
 	if !ok || len(plain) != MAC2Size {
 		return false
 	}
+
+	// A reply carrying a cookie we already hold tells us nothing new, so it
+	// earns no retransmission. Without this, one captured cookie reply replayed
+	// at us is an unbounded supply of Initials aimed at the server — the reply
+	// is 57 bytes and the Initial it provokes is 1309.
+	if held, ok := c.cookie.Load().([]byte); ok && bytes.Equal(held, plain) {
+		return true
+	}
 	c.cookie.Store(plain)
 	c.answerChallenge()
 	return true
+}
+
+// fromServer reports whether a datagram came from the address this client
+// dialled.
+//
+// A cookie reply is sealed under a key derived from the server's *public* key,
+// which is published — so anyone at all can mint one that opens, and the source
+// address is the only thing separating the server from a stranger who would
+// like this client to send a 1309-byte Initial for every 57 bytes they spend.
+func (c *clientConn) fromServer(a net.Addr) bool {
+	if c.serverAddr == nil {
+		return false
+	}
+	ua, ok := a.(*net.UDPAddr)
+	if !ok {
+		return false
+	}
+	// IP.Equal sees through the IPv4-mapped form, which a dual-stack socket may
+	// report for the same host.
+	return ua.Port == c.serverAddr.Port && ua.IP.Equal(c.serverAddr.IP)
 }
 
 // answerChallenge re-sends the last Initial straight away, now carrying MAC2.
@@ -317,6 +352,13 @@ func (c *clientConn) storeCookie(payload []byte) bool {
 // reaches the peer; where it did get through, the duplicate is discarded. Only
 // the sQUIC envelope is rebuilt, never the QUIC packet inside it.
 func (c *clientConn) answerChallenge() {
+	// One answer per Initial sent. A challenge is a response to something we
+	// sent, so answering more than once for the same Initial is work an
+	// attacker chose for us rather than work the handshake needs. Swap is the
+	// whole check: whoever gets false answers, everyone else returns.
+	if c.answered.Swap(true) {
+		return
+	}
 	last, ok := c.lastInitial.Load().(sentInitial)
 	if !ok || last.addr == nil {
 		return // nothing sent yet; the next Initial will carry the cookie
@@ -327,6 +369,8 @@ func (c *clientConn) answerChallenge() {
 // rememberInitial keeps a copy of the datagram just sent, for answerChallenge.
 func (c *clientConn) rememberInitial(p []byte, addr *net.UDPAddr) {
 	c.lastInitial.Store(sentInitial{datagram: append([]byte(nil), p...), addr: addr})
+	// A fresh Initial earns one answered challenge.
+	c.answered.Store(false)
 }
 
 // --- net.PacketConn methods (delegate to underlying UDPConn) ---
@@ -341,7 +385,7 @@ func (c *clientConn) ReadFrom(b []byte) (int, net.Addr, error) {
 		if c.handshakeDone.Load() {
 			return n, addr, nil
 		}
-		if n > 0 && b[0] == CookieReplyType {
+		if n > 0 && b[0] == CookieReplyType && c.fromServer(addr) {
 			c.storeCookie(b[1:n])
 			continue
 		}
@@ -406,7 +450,7 @@ func (c *clientConn) ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UD
 		if c.handshakeDone.Load() {
 			return
 		}
-		if n > 0 && b[0] == CookieReplyType {
+		if n > 0 && b[0] == CookieReplyType && c.fromServer(addr) {
 			c.storeCookie(b[1:n])
 			continue
 		}
@@ -453,7 +497,7 @@ func (c *clientConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 		sawCookie := false
 		for i := 0; i < n; i++ {
 			data := ms[i].Buffers[0][:ms[i].N]
-			if len(data) > 0 && data[0] == CookieReplyType {
+			if len(data) > 0 && data[0] == CookieReplyType && c.fromServer(ms[i].Addr) {
 				c.storeCookie(data[1:])
 				sawCookie = true
 				continue

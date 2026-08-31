@@ -50,7 +50,7 @@ func pair(t *testing.T, clientVersion uint8, serverVersions []uint8) (*serverCon
 	t.Cleanup(func() { cconn.Close() })
 
 	sc := newServerConn(sconn, serverPriv, nil, 0, serverVersions)
-	cc := newClientConn(cconn, shared, clientPub, nil, MAC0Key(serverPub), CookieKey(serverPub), clientVersion)
+	cc := newClientConn(cconn, shared, clientPub, nil, sconn.LocalAddr().(*net.UDPAddr), MAC0Key(serverPub), CookieKey(serverPub), clientVersion)
 	return sc, cc
 }
 
