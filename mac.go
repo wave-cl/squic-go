@@ -46,11 +46,31 @@ const (
 	// EnvelopeV2 is EnvelopeV1 plus a one-byte version marker, last (SIP-29).
 	EnvelopeV2 = 2
 
+	// EnvelopeV3 is EnvelopeV2 plus MAC0, a cheap outer MAC keyed on the
+	// server's public key and verified before any curve operation.
+	//
+	// MAC1 is a Diffie-Hellman, so a server cannot tell a caller who knows its
+	// public key from a stranger without paying for one — which is why the
+	// cookie defence has to challenge before it knows who it is talking to, and
+	// why a server under load answers everybody. WireGuard does not have this
+	// problem: its MAC1 is keyed on a *hash* of the responder's static public
+	// key and costs a hash to check, so it only ever cookies callers that have
+	// already proved they know the key. MAC0 is that construction, added
+	// alongside sQUIC's MAC1 rather than replacing it.
+	EnvelopeV3 = 3
+
+	// MAC0Size is the size of the MAC0 tag in bytes.
+	MAC0Size = 16
+
 	// VersionSize is the width of the version marker.
 	VersionSize = 1
 
 	// MACOverheadV2 is the trailer width for envelope version 2.
 	MACOverheadV2 = MACOverhead + VersionSize
+
+	// MACOverheadV3 is the trailer width for envelope version 3: version 2 plus
+	// the MAC0 field.
+	MACOverheadV3 = MACOverheadV2 + MAC0Size
 
 	// CookieReplyType is the first byte of a cookie reply packet.
 	// Distinguishes from QUIC packets (Initial starts with 0xC0+).
@@ -75,9 +95,60 @@ func TrailerLen(version uint8) (int, bool) {
 		return MACOverhead, true
 	case EnvelopeV2:
 		return MACOverheadV2, true
+	case EnvelopeV3:
+		return MACOverheadV3, true
 	default:
 		return 0, false
 	}
+}
+
+// HasMAC0 reports whether an envelope version carries a MAC0 field.
+func HasMAC0(version uint8) bool {
+	return version >= EnvelopeV3
+}
+
+// mac0KeyLabel is the domain separator for the MAC0 key.
+var mac0KeyLabel = []byte("squic-mac0-v1")
+
+// MAC0Key derives the MAC0 key from the server's X25519 public key.
+//
+// Keyed on a *public* value, deliberately. Every legitimate caller already
+// holds the server's public key — that is the premise of a silent server — so
+// both ends can compute this with one hash and no key agreement. It is
+// therefore not authentication: anyone holding the key can forge a MAC0, and
+// MAC1 remains the proof of possession. What it buys is that a caller who does
+// not hold the key can be turned away for the price of one HMAC, before the
+// cookie decision and before the Diffie-Hellman.
+func MAC0Key(serverX25519Pub []byte) [32]byte {
+	h := sha256.New()
+	h.Write(mac0KeyLabel)
+	h.Write(serverX25519Pub)
+	var key [32]byte
+	copy(key[:], h.Sum(nil))
+	return key
+}
+
+// ComputeMAC0 computes MAC0 over the envelope up to but not including MAC0.
+//
+// covered is datagram || x25519 || ed25519 || ts || nonce — one contiguous
+// slice, which is why this takes bytes rather than fields. The version is
+// prefixed for the reason SIP-29 gives for MAC1: it authenticates the marker a
+// receiver has to read before it can verify anything, and it makes tags
+// computed under different versions unrelated.
+//
+// Unlike MAC1 this covers the client's X25519 key explicitly. MAC1 does not
+// need to — that key is what its shared secret is derived from — but MAC0's key
+// does not depend on it, so leaving it out would let it be swapped.
+func ComputeMAC0(version uint8, key [32]byte, covered []byte) []byte {
+	mac := hmac.New(sha256.New, key[:])
+	mac.Write([]byte{version})
+	mac.Write(covered)
+	return mac.Sum(nil)[:MAC0Size]
+}
+
+// VerifyMAC0 checks a MAC0 tag in constant time.
+func VerifyMAC0(version uint8, key [32]byte, covered []byte, mac0 []byte) bool {
+	return subtle.ConstantTimeCompare(mac0, ComputeMAC0(version, key, covered)) == 1
 }
 
 // ComputeMAC1 computes a MAC1 tag with a timestamp and nonce for replay protection.

@@ -257,6 +257,7 @@ type clientConn struct {
 	clientPubKey     []byte           // 32-byte X25519 public key
 	advertiseEd25519 []byte           // SIP-3: 32-byte Ed25519 identity to assert, or 32 zero bytes
 	envelopeVersion  uint8            // SIP-29: the envelope version this client emits
+	mac0Key          [32]byte         // keys MAC0 (envelope v3); derived from the server's public key
 	cookieKey        [32]byte         // decrypts cookie replies; derived from the server's public key
 	handshakeDone    atomic.Bool      // true after first non-cookie packet; skips the cookie scan
 	cookie           atomic.Value     // decrypted 16-byte cookie from the server, keys MAC2
@@ -272,7 +273,7 @@ type sentInitial struct {
 	addr     *net.UDPAddr
 }
 
-func newClientConn(conn *net.UDPConn, sharedSecret, clientX25519Pub, advertiseEd25519 []byte, cookieKey [32]byte, envelopeVersion uint8) *clientConn {
+func newClientConn(conn *net.UDPConn, sharedSecret, clientX25519Pub, advertiseEd25519 []byte, mac0Key, cookieKey [32]byte, envelopeVersion uint8) *clientConn {
 	// Always a 32-byte field so the client's MAC1 input and the bytes on the
 	// wire match what the server reads and hashes (all zeros = no identity).
 	if len(advertiseEd25519) != Ed25519Size {
@@ -284,6 +285,7 @@ func newClientConn(conn *net.UDPConn, sharedSecret, clientX25519Pub, advertiseEd
 		clientPubKey:     clientX25519Pub,
 		advertiseEd25519: advertiseEd25519,
 		envelopeVersion:  envelopeVersion,
+		mac0Key:          mac0Key,
 		cookieKey:        cookieKey,
 	}
 }
@@ -494,6 +496,14 @@ func (c *clientConn) buildInitial(p []byte) []byte {
 	off += TimestampSize
 	copy(buf[off:], nonce)
 	off += NonceSize
+
+	// MAC0 (v3): computed over exactly the bytes written so far, which is the
+	// contiguous range the server hashes.
+	if HasMAC0(c.envelopeVersion) {
+		copy(buf[off:], ComputeMAC0(c.envelopeVersion, c.mac0Key, buf[:off]))
+		off += MAC0Size
+	}
+
 	copy(buf[off:], mac1)
 	off += MACSize
 
@@ -553,6 +563,7 @@ type serverConn struct {
 	allowedKeys      map[[32]byte]bool // optional whitelist of client X25519 public keys
 	batchReader      *ipv4.PacketConn  // lazy-initialized for ReadBatch
 
+	mac0Key [32]byte // keys MAC0 (envelope v3); derived from our public key
 	// MAC2 + cookie DDoS protection
 	cookieKey        [32]byte     // encrypts cookie replies; derived from our public key
 	secretsMu        sync.RWMutex // protects the two rotating secrets below
@@ -586,7 +597,9 @@ func newServerConn(conn *net.UDPConn, serverX25519Priv []byte, allowedKeys [][]b
 		peers:            newPeerTable(),
 	}
 
-	sc.cookieKey = CookieKey(x25519Public(serverX25519Priv))
+	serverPub := x25519Public(serverX25519Priv)
+	sc.cookieKey = CookieKey(serverPub)
+	sc.mac0Key = MAC0Key(serverPub)
 
 	// The previous secret starts out equal to the current one rather than
 	// random: until the first rotation there is no earlier secret, and seeding
@@ -867,6 +880,13 @@ func (c *serverConn) tryVersion(version uint8, p []byte, n int, addr *net.UDPAdd
 	off += TimestampSize
 	nonce := p[off : off+NonceSize]
 	off += NonceSize
+	// MAC0 covers everything up to here, contiguously.
+	mac0End := off
+	var mac0 []byte
+	if HasMAC0(version) {
+		mac0 = p[off : off+MAC0Size]
+		off += MAC0Size
+	}
 	mac1Start := off
 	mac1 := p[off : off+MACSize]
 	off += MACSize
@@ -878,7 +898,25 @@ func (c *serverConn) tryVersion(version uint8, p []byte, n int, addr *net.UDPAdd
 		return outcomeDrop, 0
 	}
 
-	// Step 2: MAC2 check — if under load, require valid MAC2
+	// Step 2: MAC0 — the cheap gate (envelope v3).
+	//
+	// This is the step that makes the cookie defence below silent. MAC1 is a
+	// Diffie-Hellman, so without something cheap in front of it a server cannot
+	// tell a caller who knows its public key from a stranger, and must
+	// therefore challenge both — which is how a server under load ends up
+	// answering everybody. MAC0 costs one HMAC and settles that question before
+	// the challenge is issued, and before the curve operation, so rubbish never
+	// reaches either.
+	//
+	// Versions 1 and 2 carry no MAC0 and skip this. A caller on those versions
+	// is still challenged without proving anything, so this closes the hole
+	// only for v3 traffic — and closes it outright once a deployment retires
+	// the older versions.
+	if mac0 != nil && !VerifyMAC0(version, c.mac0Key, p[:mac0End], mac0) {
+		return outcomeDrop, 0
+	}
+
+	// Step 3: MAC2 check — if under load, require valid MAC2
 	if c.underLoad.Load() {
 		isZero := true
 		for _, b := range mac2 {
@@ -912,7 +950,7 @@ func (c *serverConn) tryVersion(version uint8, p []byte, n int, addr *net.UDPAdd
 		}
 	}
 
-	// Step 3: Whitelist check (fast map lookup, before expensive DH)
+	// Step 4: Whitelist check (fast map lookup, before expensive DH)
 	c.keysMu.RLock()
 	keys := c.allowedKeys
 	c.keysMu.RUnlock()
@@ -924,7 +962,7 @@ func (c *serverConn) tryVersion(version uint8, p []byte, n int, addr *net.UDPAdd
 		}
 	}
 
-	// Step 4: DH + MAC1 verification (expensive)
+	// Step 5: DH + MAC1 verification (expensive)
 	c.dhCount.Add(1)
 	shared, dhErr := X25519(c.serverX25519Priv, clientPub)
 	if dhErr != nil {

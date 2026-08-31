@@ -1,9 +1,11 @@
 package squic
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
+	"github.com/quic-go/quic-go"
 	"net"
 	"os"
 	"os/exec"
@@ -155,5 +157,92 @@ func floodChild() {
 
 	if _, err := sc.ReadBatch(ms, 0); err != nil {
 		panic(err)
+	}
+}
+
+// buildStrangerEnvelope produces everything an attacker can make without the
+// server's public key: a real QUIC v1 header, a timestamp inside the window,
+// and noise for the rest of the envelope.
+func buildStrangerEnvelope(version uint8) []byte {
+	p := probe(0xC0, uint32(quic.Version1), 1200)
+	p[5] = 8 // DCID length
+	buf := append([]byte(nil), p...)
+	buf = append(buf, bytes.Repeat([]byte{0x42}, ClientKeySize)...)
+	buf = append(buf, make([]byte, Ed25519Size)...)
+	var ts [4]byte
+	binary.BigEndian.PutUint32(ts[:], NowTimestamp())
+	buf = append(buf, ts[:]...)
+	buf = append(buf, make([]byte, NonceSize)...)
+	if HasMAC0(version) {
+		buf = append(buf, bytes.Repeat([]byte{0x11}, MAC0Size)...) // guessed
+	}
+	buf = append(buf, bytes.Repeat([]byte{0x22}, MACSize)...)
+	buf = append(buf, bytes.Repeat([]byte{0x33}, MAC2Size)...)
+	if version != EnvelopeV1 {
+		buf = append(buf, version)
+	}
+	return buf
+}
+
+// The S8 finding, and the reason envelope v3 exists.
+//
+// Under load the server challenges before it knows who is calling, because MAC1
+// is a Diffie-Hellman and there is nothing cheaper in front of it. So a stranger
+// — no key, no captured traffic — sends something Initial-shaped with a
+// plausible timestamp and gets a cookie reply, which is a server that is
+// supposed to be silent telling them it exists.
+//
+// With v3 the same stranger is dropped at MAC0, before the challenge.
+func TestUnderLoadAStrangerIsNotChallengedOnV3(t *testing.T) {
+	sc, conn := testServerConn(t)
+	defer conn.Close()
+	sc.acceptedVersions = []uint8{EnvelopeV3}
+	sc.underLoad.Store(true)
+
+	buf := buildStrangerEnvelope(EnvelopeV3)
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40501}
+	if ok, _ := sc.validateAndStrip(buf, len(buf), addr); ok {
+		t.Fatal("a stranger's envelope was admitted")
+	}
+	if n := sc.cookieReplies.Load(); n != 0 {
+		t.Errorf("a stranger drew %d cookie replies out of a server that is supposed to be silent", n)
+	}
+}
+
+// The honest limit of this fix, pinned so nobody mistakes it for done: a server
+// that still accepts v1 keeps answering strangers on that version, because those
+// envelopes have no MAC0 to check. S8 is closed only when a deployment retires
+// the older versions.
+func TestAV1StrangerIsStillChallengedWhileV1IsAccepted(t *testing.T) {
+	sc, conn := testServerConn(t)
+	defer conn.Close()
+	sc.acceptedVersions = []uint8{EnvelopeV1, EnvelopeV3}
+	sc.underLoad.Store(true)
+
+	buf := buildStrangerEnvelope(EnvelopeV1)
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40503}
+	if ok, _ := sc.validateAndStrip(buf, len(buf), addr); ok {
+		t.Fatal("a v1 stranger was admitted")
+	}
+	if n := sc.cookieReplies.Load(); n != 1 {
+		t.Errorf("expected v1 to still leak a challenge (got %d) — if this changed, update SIP-7 and the rollout note", n)
+	}
+}
+
+// A v3 envelope whose MAC0 does not verify is dropped even when the server is
+// not under load — the gate is unconditional, so rubbish costs one HMAC rather
+// than a curve operation.
+func TestBadMAC0IsDroppedWithoutADiffieHellman(t *testing.T) {
+	sc, conn := testServerConn(t)
+	defer conn.Close()
+	sc.acceptedVersions = []uint8{EnvelopeV3}
+
+	buf := buildStrangerEnvelope(EnvelopeV3)
+	before := sc.dhCount.Load()
+	if ok, _ := sc.validateAndStrip(buf, len(buf), nil); ok {
+		t.Fatal("an envelope with a bad MAC0 was admitted")
+	}
+	if sc.dhCount.Load() != before {
+		t.Error("a Diffie-Hellman was performed for an envelope that failed MAC0")
 	}
 }

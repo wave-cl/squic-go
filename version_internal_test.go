@@ -1,6 +1,7 @@
 package squic
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
@@ -49,7 +50,7 @@ func pair(t *testing.T, clientVersion uint8, serverVersions []uint8) (*serverCon
 	t.Cleanup(func() { cconn.Close() })
 
 	sc := newServerConn(sconn, serverPriv, nil, 0, serverVersions)
-	cc := newClientConn(cconn, shared, clientPub, nil, CookieKey(serverPub), clientVersion)
+	cc := newClientConn(cconn, shared, clientPub, nil, MAC0Key(serverPub), CookieKey(serverPub), clientVersion)
 	return sc, cc
 }
 
@@ -217,11 +218,66 @@ func TestTrailerLenKnowsOnlyDefinedVersions(t *testing.T) {
 	if n, ok := TrailerLen(EnvelopeV2); !ok || n != MACOverhead+1 {
 		t.Fatalf("version 2 trailer = %d, %v", n, ok)
 	}
+	if n, ok := TrailerLen(EnvelopeV3); !ok || n != MACOverheadV2+MAC0Size {
+		t.Fatalf("version 3 trailer = %d, %v", n, ok)
+	}
 	// Version 0 is reserved and never emitted, so a zero byte is known not to
 	// be a marker.
-	for _, v := range []uint8{0, 3, 255} {
+	for _, v := range []uint8{0, 4, 255} {
 		if _, ok := TrailerLen(v); ok {
 			t.Fatalf("version %d should be unknown", v)
 		}
+	}
+}
+
+// Only v3 carries MAC0, and that is what decides whether a caller can be turned
+// away before the cookie stage.
+func TestOnlyVersion3CarriesMAC0(t *testing.T) {
+	if HasMAC0(EnvelopeV1) || HasMAC0(EnvelopeV2) || !HasMAC0(EnvelopeV3) {
+		t.Fatal("HasMAC0 does not match the envelope versions")
+	}
+}
+
+// MAC0 is keyed on the server's public key, so a caller holding that key can
+// compute it and a caller without it cannot. That is the whole property: it
+// separates "knows the key" from "does not" for the price of one HMAC, with no
+// curve operation and no cookie exchange.
+func TestMAC0SeparatesACallerWhoKnowsTheKey(t *testing.T) {
+	serverPub := bytes.Repeat([]byte{0x5C}, 32)
+	key := MAC0Key(serverPub)
+	covered := []byte("a QUIC Initial and its envelope, up to MAC0")
+
+	tag := ComputeMAC0(EnvelopeV3, key, covered)
+	if !VerifyMAC0(EnvelopeV3, key, covered, tag) {
+		t.Fatal("a MAC0 we computed ourselves did not verify")
+	}
+	stranger := MAC0Key(bytes.Repeat([]byte{0x5D}, 32))
+	if VerifyMAC0(EnvelopeV3, stranger, covered, tag) {
+		t.Error("a stranger's key verified the tag")
+	}
+	tampered := append([]byte(nil), covered...)
+	tampered[0] ^= 0xFF
+	if VerifyMAC0(EnvelopeV3, key, tampered, tag) {
+		t.Error("tampering with a covered byte did not break the tag")
+	}
+}
+
+// The version is prefixed to MAC0's input for the reason SIP-29 gives for MAC1:
+// a receiver reads the marker before it can verify anything, so the marker has
+// to be inside what it verifies.
+func TestMAC0IsBoundToTheEnvelopeVersion(t *testing.T) {
+	key := MAC0Key(bytes.Repeat([]byte{7}, 32))
+	covered := []byte("same bytes, different version")
+	if VerifyMAC0(4, key, covered, ComputeMAC0(EnvelopeV3, key, covered)) {
+		t.Fatal("a v3 tag verified under version 4")
+	}
+}
+
+// MAC0 and the cookie-reply key are both derived from the server's public key
+// and must not collide — separate labels, separate keys.
+func TestMAC0AndCookieKeysAreSeparated(t *testing.T) {
+	pub := bytes.Repeat([]byte{0x11}, 32)
+	if MAC0Key(pub) == CookieKey(pub) {
+		t.Fatal("MAC0 and cookie keys collide")
 	}
 }

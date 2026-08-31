@@ -122,10 +122,16 @@ type Config struct {
 	EnvelopeVersion uint8
 
 	// AcceptedEnvelopeVersions is the set of envelope versions this server
-	// parses (SIP-29). Nil selects both, so a server can be upgraded without
-	// waiting for its clients. Set it to just {EnvelopeV2} to retire version 1
-	// — which a deployment must be able to do, or the oldest envelope ever
+	// parses (SIP-29). Nil selects all of them, so a server can be upgraded
+	// without waiting for its clients. Drop older versions to retire them —
+	// which a deployment must be able to do, or the oldest envelope ever
 	// defined becomes a permanent floor.
+	//
+	// Retiring v1 and v2 is what finishes the job v3 starts. Only v3 carries
+	// MAC0, so only a v3 caller can be turned away before the cookie stage; a
+	// server still accepting v1 or v2 will keep answering callers on those
+	// versions with a cookie while it is under load, whatever they know. Set
+	// this to []uint8{EnvelopeV3} once the clients have moved.
 	AcceptedEnvelopeVersions []uint8
 
 	// QuicConfig allows passing additional quic-go configuration.
@@ -213,7 +219,7 @@ func (c *Config) envelopeVersion() uint8 {
 
 func (c *Config) acceptedEnvelopeVersions() []uint8 {
 	if c == nil || len(c.AcceptedEnvelopeVersions) == 0 {
-		return []uint8{EnvelopeV1, EnvelopeV2}
+		return []uint8{EnvelopeV1, EnvelopeV2, EnvelopeV3}
 	}
 	return c.AcceptedEnvelopeVersions
 }
@@ -526,7 +532,8 @@ func Dial(ctx context.Context, addr string, serverPubKey []byte, config *Config)
 	}
 
 	// Wrap with DH MAC1 appending
-	wrappedConn := newClientConn(rawConn, shared, clientPub, advertiseEd25519, CookieKey(serverX25519Pub), config.envelopeVersion())
+	wrappedConn := newClientConn(rawConn, shared, clientPub, advertiseEd25519,
+		MAC0Key(serverX25519Pub), CookieKey(serverX25519Pub), config.envelopeVersion())
 
 	tlsConf := ClientTLSConfig(serverPubKey)
 	if protos := config.nextProtos(); protos != nil {
