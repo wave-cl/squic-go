@@ -626,8 +626,16 @@ type serverConn struct {
 	dhCount          atomic.Int64 // DH operations in current second
 	cookieReplies    atomic.Int64 // challenges issued since start
 	mac2Verified     atomic.Int64 // Initials admitted on a valid MAC2
-	loadThreshold    int64        // DH/sec before entering under-load mode
-	acceptedVersions []uint8      // SIP-29: envelope versions this server parses
+	// accepted counts Initials admitted per envelope version, indexed as
+	// EnvelopeVersions.
+	//
+	// The number a deployment needs before retiring a version: without it the
+	// choice is made on nerve, and getting it wrong locks out every client that
+	// had not moved — silently, because a refused envelope is dropped without a
+	// word.
+	accepted         []atomic.Int64
+	loadThreshold    int64   // DH/sec before entering under-load mode
+	acceptedVersions []uint8 // SIP-29: envelope versions this server parses
 
 	// peers maps DCID -> MAC1-verified peer key, drained by the application at
 	// accept via the ConnContext/Tracer bridge in Listen. See SIP-2.
@@ -648,6 +656,7 @@ func newServerConn(conn *net.UDPConn, serverX25519Priv []byte, allowedKeys [][]b
 		loadThreshold:    loadThreshold,
 		acceptedVersions: acceptedVersions,
 		peers:            newPeerTable(),
+		accepted:         make([]atomic.Int64, len(EnvelopeVersions)),
 	}
 
 	serverPub := x25519Public(serverX25519Priv)
@@ -711,10 +720,15 @@ func (c *serverConn) monitorLoad() {
 
 // loadStats reports the state of the cookie defence.
 func (c *serverConn) loadStats() LoadStats {
+	accepted := make(map[uint8]int64, len(EnvelopeVersions))
+	for i, v := range EnvelopeVersions {
+		accepted[v] = c.accepted[i].Load()
+	}
 	return LoadStats{
 		UnderLoad:         c.underLoad.Load(),
 		CookieRepliesSent: c.cookieReplies.Load(),
 		MAC2Verified:      c.mac2Verified.Load(),
+		AcceptedByVersion: accepted,
 	}
 }
 
@@ -1066,6 +1080,9 @@ func (c *serverConn) tryVersion(version uint8, p []byte, n int, addr *net.UDPAdd
 		c.peers.record(dcid, key, identity, hasIdentity, time.Now())
 	}
 
+	if i, ok := VersionIndex(version); ok {
+		c.accepted[i].Add(1)
+	}
 	return outcomeAccepted, quicLen
 }
 

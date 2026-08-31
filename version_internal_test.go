@@ -281,3 +281,22 @@ func TestMAC0AndCookieKeysAreSeparated(t *testing.T) {
 		t.Fatal("MAC0 and cookie keys collide")
 	}
 }
+
+// The list and the width table are two statements of the same fact, and a
+// version added to one and not the other is a silent hole: an envelope counted
+// but never parsed, or parsed but never counted.
+func TestEveryKnownVersionHasATrailer(t *testing.T) {
+	for _, v := range EnvelopeVersions {
+		if _, ok := TrailerLen(v); !ok {
+			t.Errorf("version %d has no trailer width", v)
+		}
+		if _, ok := VersionIndex(v); !ok {
+			t.Errorf("version %d has no index", v)
+		}
+	}
+	for _, v := range []uint8{0, 200} {
+		if _, ok := VersionIndex(v); ok {
+			t.Errorf("version %d should be unknown", v)
+		}
+	}
+}

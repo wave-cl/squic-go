@@ -260,3 +260,63 @@ func TestBadMAC0IsDroppedWithoutADiffieHellman(t *testing.T) {
 		t.Error("a Diffie-Hellman was performed for an envelope that failed MAC0")
 	}
 }
+
+// The counter that turns retiring a version from nerve into arithmetic.
+//
+// A server that drops an envelope does so in silence, so retiring one that
+// clients are still sending locks them out with nothing in any log on either
+// side. Before this there was no way to ask "is anything still arriving on
+// version 2" — the question the decision rests on.
+func TestAcceptedInitialsAreCountedPerEnvelopeVersion(t *testing.T) {
+	sc, conn := testServerConn(t)
+	defer conn.Close()
+	sc.acceptedVersions = []uint8{EnvelopeV1, EnvelopeV2, EnvelopeV3}
+
+	// A rejected envelope must not be counted as an arrival on the version it
+	// claims, or the number says the opposite of what a reader needs.
+	for _, v := range EnvelopeVersions {
+		buf := buildStrangerEnvelope(v)
+		if ok, _ := sc.validateAndStrip(buf, len(buf), nil); ok {
+			t.Fatalf("a stranger's version %d envelope was admitted", v)
+		}
+	}
+	for v, n := range sc.loadStats().AcceptedByVersion {
+		if n != 0 {
+			t.Errorf("version %d counted %d rejected envelopes", v, n)
+		}
+	}
+
+	// Every known version is reported, present or not, so a reader can tell
+	// "nothing arrived on version 1" from "version 1 is not a thing here".
+	stats := sc.loadStats()
+	if len(stats.AcceptedByVersion) != len(EnvelopeVersions) {
+		t.Fatalf("reported %d versions, want %d", len(stats.AcceptedByVersion), len(EnvelopeVersions))
+	}
+	for _, v := range EnvelopeVersions {
+		if _, ok := stats.AcceptedByVersion[v]; !ok {
+			t.Errorf("version %d missing from the report", v)
+		}
+	}
+
+	// And the half that actually needs the counter to exist. Asserting only
+	// that rejected envelopes count zero passes just as well with no counter at
+	// all — measured, not assumed: without this the whole test survives
+	// deleting the increment.
+	all := []uint8{EnvelopeV1, EnvelopeV2, EnvelopeV3}
+	srv, cli := pair(t, EnvelopeV2, all)
+	for i := 0; i < 3; i++ {
+		env := cli.buildInitial(initialDatagram())
+		if ok, _ := srv.validateAndStrip(env, len(env), nil); !ok {
+			t.Fatalf("the matched client's envelope %d was refused", i)
+		}
+	}
+	got := srv.loadStats().AcceptedByVersion
+	if got[EnvelopeV2] != 3 {
+		t.Errorf("version 2 counted %d accepted Initials, want 3", got[EnvelopeV2])
+	}
+	for _, v := range []uint8{EnvelopeV1, EnvelopeV3} {
+		if got[v] != 0 {
+			t.Errorf("version %d counted %d, want 0 — a version is counting another's traffic", v, got[v])
+		}
+	}
+}

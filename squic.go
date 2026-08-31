@@ -437,6 +437,17 @@ type LoadStats struct {
 	CookieRepliesSent int64
 	// MAC2Verified counts Initial packets admitted on a valid MAC2.
 	MAC2Verified int64
+	// AcceptedByVersion counts Initials admitted, keyed by envelope version.
+	//
+	// The number to look at before retiring a version (SIP-29). A server that
+	// drops an envelope does so in silence, so retiring one that clients are
+	// still sending locks them out with no diagnostic on either side — this is
+	// the evidence that turns that decision from nerve into arithmetic.
+	//
+	// Counts accepted Initials, not connections: a handshake retransmits, so
+	// treat these as "is anything still arriving on this version", not as a
+	// connection count.
+	AcceptedByVersion map[uint8]int64
 }
 
 // LoadStats returns a snapshot of the cookie defence's state.

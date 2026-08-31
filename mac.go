@@ -102,6 +102,24 @@ func TrailerLen(version uint8) (int, bool) {
 	}
 }
 
+// EnvelopeVersions is every envelope version this build knows, lowest first.
+//
+// The one list to extend when a version is added — TrailerLen and the
+// per-version accept counters are both keyed off it, and
+// TestEveryKnownVersionHasATrailer fails if the two drift apart.
+var EnvelopeVersions = []uint8{EnvelopeV1, EnvelopeV2, EnvelopeV3}
+
+// VersionIndex returns the position of version in EnvelopeVersions, for
+// indexing per-version state, and false for a version this build does not know.
+func VersionIndex(version uint8) (int, bool) {
+	for i, v := range EnvelopeVersions {
+		if v == version {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
 // HasMAC0 reports whether an envelope version carries a MAC0 field.
 func HasMAC0(version uint8) bool {
 	return version >= EnvelopeV3
