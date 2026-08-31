@@ -5,7 +5,13 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"net"
+	"os"
+	"os/exec"
+	"runtime/debug"
 	"testing"
+	"time"
+
+	"golang.org/x/net/ipv4"
 )
 
 // probe builds a long-header packet of the given type carrying a QUIC version
@@ -77,5 +83,77 @@ func TestSupportedVersionNonInitialPassesThrough(t *testing.T) {
 	short := []byte{0x40, 1, 2, 3, 4, 5}
 	if ok, n := sc.validateAndStrip(short, len(short), nil); !ok || n != len(short) {
 		t.Errorf("short header not passed through: ok=%v n=%d", ok, n)
+	}
+}
+
+// Dropping a whole batch is the *expected* outcome under the flood this server
+// exists to discard cheaply. Recursing once per dropped batch never unwinds:
+// the stack grows until Go aborts the process with "goroutine stack exceeds",
+// which recover() cannot catch, so the only way to observe it is from outside.
+//
+// The child lowers its own stack limit so the failure, if present, arrives in
+// seconds rather than after a gigabyte.
+func TestReadBatchDoesNotRecurseUnderAFlood(t *testing.T) {
+	if os.Getenv("SQUIC_FLOOD_CHILD") == "1" {
+		floodChild()
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=TestReadBatchDoesNotRecurseUnderAFlood", "-test.timeout=60s")
+	cmd.Env = append(os.Environ(), "SQUIC_FLOOD_CHILD=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("the read path did not survive a flood of dropped packets: %v\n%s", err, out)
+	}
+}
+
+func floodChild() {
+	// Small enough that recursion reaches it in a few thousand frames, large
+	// enough that the runtime is comfortable.
+	debug.SetMaxStack(1 << 20)
+
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+	sc := newServerConn(conn, Ed25519PrivateToX25519(priv), nil, 1000, []uint8{EnvelopeV1, EnvelopeV2})
+
+	sender, err := net.DialUDP("udp", nil, conn.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		panic(err)
+	}
+	defer sender.Close()
+
+	done := make(chan struct{})
+	go func() {
+		// Packets that are always dropped, so every batch is an empty one.
+		junk := probe(0xE0, 0xDEADBEEF, 1200)
+		deadline := time.Now().Add(20 * time.Second)
+		for time.Now().Before(deadline) {
+			select {
+			case <-done:
+				// One short header, so the reader has something to return.
+				sender.Write([]byte{0x40, 1, 2, 3, 4, 5})
+				return
+			default:
+			}
+			sender.Write(junk)
+		}
+	}()
+
+	ms := make([]ipv4.Message, 8)
+	for i := range ms {
+		ms[i].Buffers = [][]byte{make([]byte, 1500)}
+	}
+
+	// Give the flood time to drive several thousand dropped batches through the
+	// read path, then release the reader with a packet it will accept.
+	go func() {
+		time.Sleep(6 * time.Second)
+		close(done)
+	}()
+
+	if _, err := sc.ReadBatch(ms, 0); err != nil {
+		panic(err)
 	}
 }

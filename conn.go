@@ -360,39 +360,44 @@ func (c *clientConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 		c.batchReader = ipv4.NewPacketConn(c.conn)
 	}
 
-	n, err := c.batchReader.ReadBatch(ms, flags)
-	if err != nil {
-		return 0, err
-	}
+	// A loop rather than recursion, for the reason given on serverConn.ReadBatch:
+	// a peer that can send cookie replies can send nothing else, and recursing
+	// per batch would grow the stack until the process aborts.
+	for {
+		n, err := c.batchReader.ReadBatch(ms, flags)
+		if err != nil {
+			return 0, err
+		}
 
-	// Fast path: after the handshake there are no cookie replies to look for.
-	if c.handshakeDone.Load() {
-		return n, nil
-	}
+		// Fast path: after the handshake there are no cookie replies to look for.
+		if c.handshakeDone.Load() {
+			return n, nil
+		}
 
-	valid := 0
-	sawCookie := false
-	for i := 0; i < n; i++ {
-		data := ms[i].Buffers[0][:ms[i].N]
-		if len(data) > 0 && data[0] == CookieReplyType {
-			c.storeCookie(data[1:])
-			sawCookie = true
+		valid := 0
+		sawCookie := false
+		for i := 0; i < n; i++ {
+			data := ms[i].Buffers[0][:ms[i].N]
+			if len(data) > 0 && data[0] == CookieReplyType {
+				c.storeCookie(data[1:])
+				sawCookie = true
+				continue
+			}
+			if valid != i {
+				ms[valid] = ms[i]
+			}
+			valid++
+		}
+
+		if !sawCookie {
+			return n, nil
+		}
+		if valid == 0 {
+			// The whole batch was cookie replies — read the next one.
 			continue
 		}
-		if valid != i {
-			ms[valid] = ms[i]
-		}
-		valid++
+		return valid, nil
 	}
-
-	if !sawCookie {
-		return n, nil
-	}
-	if valid == 0 {
-		// The whole batch was cookie replies — nothing for quic-go yet.
-		return c.ReadBatch(ms, flags)
-	}
-	return valid, nil
 }
 
 // buildInitial constructs the Initial packet with MAC1 + MAC2 appended.
@@ -655,34 +660,41 @@ func (c *serverConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 		c.batchReader = ipv4.NewPacketConn(c.conn)
 	}
 
-	n, err := c.batchReader.ReadBatch(ms, flags)
-	if err != nil {
-		return 0, err
-	}
-
-	// Filter: validate MAC1 on each message, compact valid ones to the front
-	valid := 0
-	for i := 0; i < n; i++ {
-		data := ms[i].Buffers[0][:ms[i].N]
-		var addr *net.UDPAddr
-		if ms[i].Addr != nil {
-			addr, _ = ms[i].Addr.(*net.UDPAddr)
+	// A loop, not recursion. Dropping a whole batch is the *expected* outcome
+	// under the flood this server is built to discard cheaply, so recursing
+	// once per batch never unwinds: the stack grows until Go aborts the process
+	// with "goroutine stack exceeds", which recover() cannot catch. squic-rust
+	// has always looped here.
+	for {
+		n, err := c.batchReader.ReadBatch(ms, flags)
+		if err != nil {
+			return 0, err
 		}
-		if ok, stripped := c.validateAndStrip(data, ms[i].N, addr); ok {
-			if valid != i {
-				ms[valid] = ms[i]
+
+		// Filter: validate MAC1 on each message, compact valid ones to the front
+		valid := 0
+		for i := 0; i < n; i++ {
+			data := ms[i].Buffers[0][:ms[i].N]
+			var addr *net.UDPAddr
+			if ms[i].Addr != nil {
+				addr, _ = ms[i].Addr.(*net.UDPAddr)
 			}
-			ms[valid].N = stripped
-			valid++
+			if ok, stripped := c.validateAndStrip(data, ms[i].N, addr); ok {
+				if valid != i {
+					ms[valid] = ms[i]
+				}
+				ms[valid].N = stripped
+				valid++
+			}
 		}
-	}
 
-	if valid == 0 {
-		// All packets in this batch were invalid — try again
-		return c.ReadBatch(ms, flags)
-	}
+		if valid == 0 {
+			// All packets in this batch were invalid — read the next one.
+			continue
+		}
 
-	return valid, nil
+		return valid, nil
+	}
 }
 
 // validateAndStrip checks if the packet is valid and strips MAC overhead from Initial packets.
