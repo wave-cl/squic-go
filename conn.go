@@ -78,9 +78,21 @@ func versionAccepted(data []byte) bool {
 // accept, which is sub-second in practice.
 const peerKeyTTL = 30 * time.Second
 
-// peerTablePruneAt is the live-entry count above which an insert first drops
-// expired entries, keeping the table bounded without a background goroutine.
-const peerTablePruneAt = 512
+// peerTableMax is the most insertion records the table will hold, and so the
+// most live entries — every live entry owns exactly one record.
+//
+// The table is filled by anything that passes MAC1, which without a whitelist
+// is anyone holding the server's public key: a value that is *published*,
+// being the tail of the connection string. The previous arrangement pruned only
+// *expired* entries and then inserted regardless, so it freed nothing whenever
+// arrivals outran the TTL — which is exactly what an attacker arranges — and
+// the table grew without limit while every insert paid for a full scan that
+// reclaimed nothing.
+//
+// At roughly 250 bytes an entry this bounds the table to about 4 MB. The
+// healthy steady state is near-empty: an entry lives from the first Initial to
+// accept, which is sub-second.
+const peerTableMax = 16384
 
 type peerEntry struct {
 	key [32]byte
@@ -101,10 +113,49 @@ type peerEntry struct {
 type peerTable struct {
 	mu      sync.Mutex
 	entries map[string]peerEntry
+	// order holds one record per entry, in insertion order, so expiry and
+	// eviction are both amortised O(1) and neither scans the map.
+	//
+	// A record is appended once, when the entry is first recorded, and its
+	// timestamp never changes — which is what makes the front always the
+	// oldest. A record whose timestamp no longer matches the map (the entry was
+	// taken at accept, or evicted and re-recorded since) is stale, and is
+	// discarded without touching whatever is there now.
+	order []orderRecord
+}
+
+// orderRecord names an entry and when it was first recorded.
+type orderRecord struct {
+	inserted time.Time
+	dcid     string
 }
 
 func newPeerTable() *peerTable {
 	return &peerTable{entries: make(map[string]peerEntry)}
+}
+
+// dropFront drops the oldest record, and the entry it names if that entry is
+// still the one the record refers to. Reports whether a live entry went too.
+func (t *peerTable) dropFront() bool {
+	if len(t.order) == 0 {
+		return false
+	}
+	r := t.order[0]
+	t.order = t.order[1:]
+	if e, ok := t.entries[r.dcid]; ok && e.inserted.Equal(r.inserted) {
+		delete(t.entries, r.dcid)
+		return true
+	}
+	return false // stale record; the entry it named is already gone
+}
+
+// expire drops everything past its TTL. Timestamps never change and records are
+// appended in order, so the front is always the oldest and this stops at the
+// first live one — no scan, and no dependence on how full the table is.
+func (t *peerTable) expire(now time.Time) {
+	for len(t.order) > 0 && now.Sub(t.order[0].inserted) >= peerKeyTTL {
+		t.dropFront()
+	}
 }
 
 // record stores dcid -> key for an Initial that just passed MAC1. A repeat of
@@ -115,28 +166,50 @@ func newPeerTable() *peerTable {
 func (t *peerTable) record(dcid []byte, key [32]byte, identity [32]byte, hasIdentity bool, now time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if len(t.entries) >= peerTablePruneAt {
-		for k, e := range t.entries {
-			if now.Sub(e.inserted) >= peerKeyTTL {
-				delete(t.entries, k)
-			}
-		}
-	}
+
+	// An entry that is already here is settled in place, ahead of any expiry or
+	// eviction, so a live connection is never turned away by pressure a flood
+	// created a moment ago.
+	//
+	// A retransmission no longer extends the entry: it lives its TTL from when
+	// it was first seen. That is what lets the order queue be exact — a
+	// timestamp that never moves means the front is always the oldest — and it
+	// stops a peer holding an entry open indefinitely by retransmitting. The
+	// TTL is 30s against a 10s handshake timeout, so the first sighting already
+	// covers the whole handshake.
 	k := string(dcid)
 	if e, ok := t.entries[k]; ok {
 		switch {
 		case e.poisoned:
 			// stays poisoned
 		case e.key == key && e.identity == identity && e.hasIdentity == hasIdentity:
-			e.inserted = now
-			t.entries[k] = e
+			// a retransmission; the entry keeps its original expiry
 		default:
 			e.poisoned = true
 			t.entries[k] = e
 		}
 		return
 	}
+
+	t.expire(now)
+
+	// Every live entry owns exactly one record, so bounding the queue bounds
+	// the map. Dropping from the front evicts the oldest, which is the right
+	// end: a legitimate caller's entry is read within milliseconds of being
+	// written, so it is the newest thing here and the last to go.
+	//
+	// Under a flood heavy enough to fill this, some legitimate peer keys will
+	// be evicted before their connection is accepted, and those connections are
+	// then anonymous. That is a refusal at every consumer that fails closed,
+	// which is the correct way to lose: the alternative this replaces was
+	// unbounded growth and an O(n) prune per insert under the lock on the
+	// receive path, which loses everything.
+	for len(t.order) >= peerTableMax {
+		t.dropFront()
+	}
+
 	t.entries[k] = peerEntry{key: key, identity: identity, hasIdentity: hasIdentity, inserted: now}
+	t.order = append(t.order, orderRecord{inserted: now, dcid: k})
 }
 
 // take removes and returns the (key, identity) for dcid, if one is recorded,
