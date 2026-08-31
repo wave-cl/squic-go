@@ -138,19 +138,24 @@ func TestAnswerChallengeRetransmitsImmediately(t *testing.T) {
 // deployed. This is that later release, so the default is version 2 — and a
 // server still accepts version 1, because retiring it is a separate decision a
 // deployment makes for itself.
-func TestClientDefaultIsVersion2AndServersStillAcceptVersion1(t *testing.T) {
+func TestClientDefaultIsVersion3AndServersStillAcceptTheOlderOnes(t *testing.T) {
 	for _, cfg := range []*Config{nil, {}} {
-		if got := cfg.envelopeVersion(); got != EnvelopeV2 {
-			t.Fatalf("client default = %d, want %d", got, EnvelopeV2)
+		if got := cfg.envelopeVersion(); got != EnvelopeV3 {
+			t.Fatalf("client default = %d, want %d", got, EnvelopeV3)
 		}
+		// A server upgraded to this release still serves the clients that have
+		// not moved. Retiring the older versions is a deployment's own
+		// decision, and the thing that finally makes the cookie stage silent
+		// (SIP-37).
 		accepted := cfg.acceptedEnvelopeVersions()
-		var sawV1, sawV2 bool
-		for _, v := range accepted {
-			sawV1 = sawV1 || v == EnvelopeV1
-			sawV2 = sawV2 || v == EnvelopeV2
-		}
-		if !sawV1 || !sawV2 {
-			t.Fatalf("server default accepts %v, want both versions", accepted)
+		for _, want := range []uint8{EnvelopeV1, EnvelopeV2, EnvelopeV3} {
+			var saw bool
+			for _, v := range accepted {
+				saw = saw || v == want
+			}
+			if !saw {
+				t.Fatalf("server default accepts %v, missing version %d", accepted, want)
+			}
 		}
 	}
 }
