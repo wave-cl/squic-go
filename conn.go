@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/quic-go/quic-go"
 	"golang.org/x/net/ipv4"
 )
 
@@ -30,6 +31,44 @@ func isQUICInitial(data []byte) bool {
 // nothing before it does.
 func isShortHeader(data []byte) bool {
 	return len(data) > 0 && data[0]&0xC0 == 0x40
+}
+
+// isLongHeader reports whether a packet has a QUIC long header: the header-form
+// bit is set. Initial, 0-RTT, Handshake and Retry all look like this.
+func isLongHeader(data []byte) bool {
+	return len(data) > 0 && data[0]&0x80 != 0
+}
+
+// supportedVersions is the set quic-go parses, and the set this server will
+// accept a long header for. Kept as the exported constants rather than a
+// literal so it cannot drift from the stack it is protecting.
+var supportedVersions = []quic.Version{quic.Version1, quic.Version2}
+
+// versionAccepted reports whether the QUIC stack behind us would parse this
+// long header's version.
+//
+// The envelope gates Initials, but *every* long header reaches the QUIC stack,
+// and a stack that does not recognise the version answers with a Version
+// Negotiation packet before it has looked at the connection at all. That reply
+// costs the caller no key and no captured traffic, so without this gate one
+// datagram proves the server exists and SIP-6's silence is over.
+//
+// Only the unknown-version case is dropped. A long header the stack does
+// recognise has to pass: the client's Handshake packets are long-headed too,
+// and dropping every non-Initial long header would break every connection at
+// the second flight. Those are already silent — quic-go ignores a non-Initial
+// long header for a connection it does not know.
+func versionAccepted(data []byte) bool {
+	if len(data) < 5 {
+		return false
+	}
+	v := quic.Version(binary.BigEndian.Uint32(data[1:5]))
+	for _, s := range supportedVersions {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 // peerKeyTTL bounds how long a validated peer key is retained before the
@@ -673,6 +712,14 @@ const (
 //
 // addr is used to send cookie replies when under load (can be nil to skip).
 func (c *serverConn) validateAndStrip(p []byte, n int, addr *net.UDPAddr) (bool, int) {
+	// A long header the QUIC stack cannot version-parse draws a Version
+	// Negotiation reply out of it, which is a response to a caller that proved
+	// nothing. Drop those here, before the stack sees them. See versionAccepted
+	// for why the gate is on the version and not the packet type.
+	if isLongHeader(p[:n]) && !versionAccepted(p[:n]) {
+		return false, 0
+	}
+
 	// Non-Initial packets pass through unmodified
 	if !isQUICInitial(p[:n]) {
 		return true, n

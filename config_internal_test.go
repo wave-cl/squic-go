@@ -2,6 +2,8 @@ package squic
 
 import (
 	"crypto/rand"
+	"encoding/binary"
+	"github.com/quic-go/quic-go"
 	"net"
 	"testing"
 	"time"
@@ -97,6 +99,7 @@ func TestAnswerChallengeRetransmitsImmediately(t *testing.T) {
 	// With an Initial on record, the next cookie must trigger a resend of it.
 	datagram := make([]byte, 1200)
 	datagram[0] = 0xC0 // long header, Initial
+	binary.BigEndian.PutUint32(datagram[1:5], uint32(quic.Version1))
 	c.rememberInitial(datagram, peer.LocalAddr().(*net.UDPAddr))
 
 	if !c.storeCookie(sealed) {

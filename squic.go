@@ -291,6 +291,12 @@ func Listen(network, addr string, serverCert tls.Certificate, serverPubKey []byt
 	// verified.
 	tr := &quic.Transport{
 		Conn: wrappedConn,
+		// Belt and braces with the version gate in validateAndStrip. A Version
+		// Negotiation packet is a reply to a caller that has proved nothing,
+		// which is exactly what a silent server must not send; the gate stops
+		// those packets reaching quic-go, and this stops quic-go answering if
+		// one ever does.
+		DisableVersionNegotiationPackets: true,
 		ConnContext: func(ctx context.Context, _ *quic.ClientInfo) (context.Context, error) {
 			return context.WithValue(ctx, peerKeyCtxKey{}, &peerKeyHolder{}), nil
 		},

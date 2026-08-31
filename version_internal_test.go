@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"github.com/quic-go/quic-go"
 	"net"
 	"testing"
 )
@@ -55,6 +56,11 @@ func pair(t *testing.T, clientVersion uint8, serverVersions []uint8) (*serverCon
 func initialDatagram() []byte {
 	p := make([]byte, testDatagram)
 	p[0] = 0xC0 // long header, fixed bit, Initial
+	// QUIC v1, big-endian in bytes 1..5. The version field is load-bearing in a
+	// fixture: the server drops a long header whose version quic-go would not
+	// parse, and it does so ahead of the envelope, so a datagram left at
+	// version 0 never reaches the code these tests are about.
+	binary.BigEndian.PutUint32(p[1:5], uint32(quic.Version1))
 	return p
 }
 

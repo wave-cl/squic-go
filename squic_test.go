@@ -6,8 +6,10 @@ import (
 	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"github.com/quic-go/quic-go"
 	"io"
 	"net"
 	"sync"
@@ -271,7 +273,10 @@ func TestSilentServerDropsInvalidMAC(t *testing.T) {
 	// Send fake Initial packet (long header, type Initial)
 	garbage := make([]byte, 1200)
 	garbage[0] = 0xC0 // long header, Initial type
-	garbage[1] = 0x01 // version
+	// QUIC v1 — big-endian, so bytes 1..5 and not byte 1 alone. A long header
+	// whose version the stack would not parse is dropped before the envelope is
+	// read, which would leave this test passing without reaching MAC1 at all.
+	binary.BigEndian.PutUint32(garbage[1:5], uint32(quic.Version1))
 	rawConn.Write(garbage)
 
 	// Send another with random client key + wrong MAC1
@@ -490,7 +495,9 @@ func TestWhitelistDHCannotBeForged(t *testing.T) {
 	// Craft fake Initial packet with victim's pubkey but wrong MAC
 	fakePacket := make([]byte, 1200)
 	fakePacket[0] = 0xC0 // Initial packet header
-	fakePacket[1] = 0x01
+	// QUIC v1, big-endian. Without a version the stack parses, the forgery is
+	// refused at the version gate and this test never exercises MAC1.
+	binary.BigEndian.PutUint32(fakePacket[1:5], uint32(quic.Version1))
 
 	fakeMAC := make([]byte, squic.MACSize)
 	rand.Read(fakeMAC)
@@ -861,6 +868,9 @@ func TestSmallOrderClientKeyIsRefused(t *testing.T) {
 
 	datagram := make([]byte, 1200)
 	datagram[0] = 0xC0
+	// QUIC v1, big-endian — otherwise the version gate refuses this before the
+	// small-order check ever runs, and the test passes for the wrong reason.
+	binary.BigEndian.PutUint32(datagram[1:5], uint32(quic.Version1))
 	zeroKey := make([]byte, 32)
 	assumedShared := make([]byte, 32) // the attacker assumes zeros, and is right
 
