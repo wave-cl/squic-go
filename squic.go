@@ -107,12 +107,18 @@ type Config struct {
 
 	// EnvelopeVersion is the envelope version this client emits (SIP-29).
 	//
-	// Zero means unset and selects EnvelopeV2 as of v0.63.0. It selected
-	// EnvelopeV1 in v0.62.0, which is the discipline SIP-29 requires — a
-	// release that introduces a version ships clients still sending the
-	// previous one, so that upgrading a client before a server cannot break
-	// anything, and a later release moves the default once servers have had
-	// time to deploy. This is that later release.
+	// Zero means unset and selects EnvelopeV2, unchanged in v0.64.0 even
+	// though that release introduces EnvelopeV3. That is the discipline SIP-29
+	// requires — a release that introduces a version ships clients still
+	// sending the previous one, so that upgrading a client before a server
+	// cannot break anything, and a later release moves the default once
+	// servers have had time to deploy. This is the *earlier* half for version
+	// 3; v0.63.0 was the later half for version 2.
+	//
+	// Set it to EnvelopeV3 to opt in early, against servers known to be
+	// v0.64.0 or newer. Version 3 is what carries MAC0 (SIP-37), so a
+	// deployment that wants a server silent under load needs its clients on it
+	// before the server can retire versions 1 and 2.
 	//
 	// Set it to EnvelopeV1 if you still talk to a server older than squic-go
 	// v0.62.0, which will drop a version 2 Initial in silence.
