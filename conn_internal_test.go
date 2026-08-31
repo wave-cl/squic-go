@@ -118,7 +118,7 @@ func floodChild() {
 		panic(err)
 	}
 	defer conn.Close()
-	sc := newServerConn(conn, Ed25519PrivateToX25519(priv), nil, 1000, []uint8{EnvelopeV1, EnvelopeV2})
+	sc := newServerConn(conn, Ed25519PrivateToX25519(priv), nil, 1000, []uint8{EnvelopeV1, EnvelopeV2, EnvelopeV3})
 
 	sender, err := net.DialUDP("udp", nil, conn.LocalAddr().(*net.UDPAddr))
 	if err != nil {
@@ -126,21 +126,41 @@ func floodChild() {
 	}
 	defer sender.Close()
 
-	done := make(chan struct{})
+	stopFlood := make(chan struct{})
+	readerDone := make(chan struct{})
+
 	go func() {
 		// Packets that are always dropped, so every batch is an empty one.
 		junk := probe(0xE0, 0xDEADBEEF, 1200)
-		deadline := time.Now().Add(20 * time.Second)
-		for time.Now().Before(deadline) {
+		for {
 			select {
-			case <-done:
-				// One short header, so the reader has something to return.
-				sender.Write([]byte{0x40, 1, 2, 3, 4, 5})
-				return
+			case <-stopFlood:
+				// Release the reader with something it will accept. Offer it
+				// repeatedly rather than once: a single packet is easily lost
+				// in the backlog the flood just built, and a test that hangs
+				// when the release is dropped is a test that fails at random.
+				short := []byte{0x40, 1, 2, 3, 4, 5}
+				for {
+					select {
+					case <-readerDone:
+						return
+					default:
+					}
+					sender.Write(short)
+					time.Sleep(20 * time.Millisecond)
+				}
 			default:
 			}
 			sender.Write(junk)
 		}
+	}()
+
+	// Long enough to drive several thousand dropped batches through the read
+	// path. With the recursion present the stack limit is reached in well
+	// under a second, so this only bounds the healthy case.
+	go func() {
+		time.Sleep(6 * time.Second)
+		close(stopFlood)
 	}()
 
 	ms := make([]ipv4.Message, 8)
@@ -148,16 +168,10 @@ func floodChild() {
 		ms[i].Buffers = [][]byte{make([]byte, 1500)}
 	}
 
-	// Give the flood time to drive several thousand dropped batches through the
-	// read path, then release the reader with a packet it will accept.
-	go func() {
-		time.Sleep(6 * time.Second)
-		close(done)
-	}()
-
 	if _, err := sc.ReadBatch(ms, 0); err != nil {
 		panic(err)
 	}
+	close(readerDone)
 }
 
 // buildStrangerEnvelope produces everything an attacker can make without the
