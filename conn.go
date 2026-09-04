@@ -808,6 +808,16 @@ func (c *serverConn) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (int, int, er
 // Without this, quic-go would unwrap our SyscallConn() and read the raw FD directly,
 // completely bypassing our MAC1 validation.
 func (c *serverConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
+	// No UDP_GRO here, and that is deliberate — see S9. squic-rust hit a real
+	// bug by inheriting it from quinn-udp: with GRO on, the kernel returns one
+	// descriptor covering several coalesced datagrams, and validating the
+	// concatenation as a single Initial silently drops every one of them. This
+	// path never enables GRO, so each datagram arrives on its own, and the
+	// filter below is right by construction rather than by luck. Anyone adding
+	// GRO for throughput has to solve stripping first: the trailer width varies
+	// by envelope version, so stripped segments are not uniformly sized and
+	// cannot be described by a single stride.
+	//
 	// Use the underlying ipv4.PacketConn for actual batch reads (recvmmsg on Linux)
 	if c.batchReader == nil {
 		c.batchReader = ipv4.NewPacketConn(c.conn)
