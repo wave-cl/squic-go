@@ -474,6 +474,47 @@ func (c *clientConn) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int,
 // replies never reach storeCookie and land in quic-go as unparseable packets
 // instead — leaving the client unable to answer a challenge it did receive.
 // serverConn needs the same override for MAC1 validation.
+// moveMessage moves packet src's contents into slot dst, leaving each slot's
+// own Buffers where it is. Returns false if dst's buffer cannot hold n bytes,
+// in which case nothing is written and the caller must drop the packet rather
+// than forward a truncated one.
+//
+// The obvious way to compact — `ms[dst] = ms[src]` — is wrong here, and wrong
+// in a way that corrupts packet data rather than merely leaking. quic-go keeps
+// a parallel array and pairs the two **by index** (sys_conn_oob.go, ReadPacket):
+//
+//	msg := c.messages[c.readPos]
+//	buffer := c.buffers[c.readPos]
+//	p := receivedPacket{data: msg.Buffers[0][:msg.N], buffer: buffer}
+//
+// and it re-establishes that pairing itself, refreshing only the slots below
+// readPos. Assigning the whole ipv4.Message carries Buffers across with it, so
+// quic-go then hands the application packet src's bytes paired with slot dst's
+// buffer handle. Releasing that packet returns the wrong buffer to the pool,
+// while the memory actually holding the live data is never refreshed and is
+// written into by the next recvmmsg.
+//
+// So squic copies the payload rather than the descriptor, which is what
+// squic-rust has always done — it copies bytes between buffers and was never
+// exposed to this. The contract being honoured: ReadBatch may fill messages,
+// but it must not reorder their buffers.
+func moveMessage(ms []ipv4.Message, dst, src, n int) bool {
+	if len(ms[dst].Buffers) == 0 || len(ms[dst].Buffers[0]) < n {
+		return false
+	}
+	copy(ms[dst].Buffers[0], ms[src].Buffers[0][:n])
+	ms[dst].N = n
+	if nn := ms[src].NN; nn > 0 && len(ms[dst].OOB) >= nn {
+		copy(ms[dst].OOB, ms[src].OOB[:nn])
+		ms[dst].NN = nn
+	} else {
+		ms[dst].NN = 0
+	}
+	ms[dst].Addr = ms[src].Addr
+	ms[dst].Flags = ms[src].Flags
+	return true
+}
+
 func (c *clientConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	if c.batchReader == nil {
 		c.batchReader = ipv4.NewPacketConn(c.conn)
@@ -502,8 +543,8 @@ func (c *clientConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 				sawCookie = true
 				continue
 			}
-			if valid != i {
-				ms[valid] = ms[i]
+			if valid != i && !moveMessage(ms, valid, i, ms[i].N) {
+				continue
 			}
 			valid++
 		}
@@ -844,9 +885,12 @@ func (c *serverConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 			}
 			if ok, stripped := c.validateAndStrip(data, ms[i].N, addr); ok {
 				if valid != i {
-					ms[valid] = ms[i]
+					if !moveMessage(ms, valid, i, stripped) {
+						continue
+					}
+				} else {
+					ms[valid].N = stripped
 				}
-				ms[valid].N = stripped
 				valid++
 			}
 		}

@@ -320,3 +320,93 @@ func TestAcceptedInitialsAreCountedPerEnvelopeVersion(t *testing.T) {
 		}
 	}
 }
+
+// S12: compacting a batch must not move buffers between slots.
+//
+// quic-go keeps a parallel array of packet buffers and pairs it with the
+// messages **by index** (sys_conn_oob.go, ReadPacket), refreshing that pairing
+// itself for the slots it has consumed. squic used to compact with
+// `ms[dst] = ms[src]`, which copies the whole ipv4.Message including Buffers,
+// so quic-go was handed one packet's bytes paired with another's buffer handle:
+// releasing it returned the wrong buffer to the pool while the memory holding
+// the live data was overwritten by the next recvmmsg. Data corruption, not a
+// leak.
+//
+// This asserts the contract directly — ReadBatch may fill messages, it must not
+// reorder their buffers — rather than through ReadBatch itself. A batch test
+// would be unreliable: without recvmmsg, x/net reads one message per call, so
+// compaction would never trigger and the test would pass without exercising
+// anything, which is worse than no test at all.
+func TestCompactionKeepsEachSlotsOwnBuffer(t *testing.T) {
+	const size = 1500
+	ms := make([]ipv4.Message, 3)
+	spine := make([]*byte, len(ms))
+	for i := range ms {
+		buf := make([]byte, size)
+		// Fill each buffer with its own index so a swapped buffer is visible.
+		for j := range buf {
+			buf[j] = byte(i)
+		}
+		ms[i].Buffers = [][]byte{buf}
+		ms[i].OOB = make([]byte, 64)
+		ms[i].N = size
+		// Identity of the backing array, which is what quic-go pairs on.
+		spine[i] = &ms[i].Buffers[0][0]
+	}
+
+	src, dst, n := 2, 0, 42
+	ms[src].Addr = &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 9999}
+	ms[src].OOB[0] = 0xAB
+	ms[src].NN = 1
+
+	if !moveMessage(ms, dst, src, n) {
+		t.Fatal("moveMessage refused a destination that is plainly big enough")
+	}
+
+	// The invariant. With `ms[dst] = ms[src]` this is where it fails.
+	for i := range ms {
+		if got := &ms[i].Buffers[0][0]; got != spine[i] {
+			t.Errorf("slot %d no longer owns its original buffer: quic-go pairs "+
+				"messages and buffers by index, so it would now hand the "+
+				"application one packet's bytes with another's buffer handle", i)
+		}
+	}
+
+	// And the move actually moved something.
+	if ms[dst].N != n {
+		t.Errorf("N = %d, want %d", ms[dst].N, n)
+	}
+	for j := 0; j < n; j++ {
+		if ms[dst].Buffers[0][j] != byte(src) {
+			t.Fatalf("payload not copied: byte %d is %d, want %d",
+				j, ms[dst].Buffers[0][j], src)
+		}
+	}
+	// Byte n is past what was copied, so it must still be the destination's own.
+	if ms[dst].Buffers[0][n] != byte(dst) {
+		t.Errorf("copied past N: byte %d is %d, want the destination's own %d",
+			n, ms[dst].Buffers[0][n], dst)
+	}
+	if ms[dst].NN != 1 || ms[dst].OOB[0] != 0xAB {
+		t.Errorf("OOB not carried: NN=%d OOB[0]=%#02x", ms[dst].NN, ms[dst].OOB[0])
+	}
+	if ms[dst].Addr == nil || ms[dst].Addr.String() != "10.0.0.1:9999" {
+		t.Errorf("Addr not carried: %v", ms[dst].Addr)
+	}
+}
+
+// A destination too small is refused rather than silently truncated — the
+// caller drops the packet instead of forwarding a short one.
+func TestCompactionRefusesATooSmallDestination(t *testing.T) {
+	ms := make([]ipv4.Message, 2)
+	ms[0].Buffers = [][]byte{make([]byte, 10)}
+	ms[1].Buffers = [][]byte{make([]byte, 1500)}
+	ms[1].N = 1200
+
+	if moveMessage(ms, 0, 1, 1200) {
+		t.Fatal("moveMessage claimed success writing 1200 bytes into a 10-byte buffer")
+	}
+	if ms[0].N != 0 {
+		t.Errorf("a refused move still wrote N = %d", ms[0].N)
+	}
+}
