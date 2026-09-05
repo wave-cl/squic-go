@@ -420,3 +420,55 @@ func TestCompactionRefusesATooSmallDestination(t *testing.T) {
 		t.Errorf("a refused move still wrote N = %d", ms[0].N)
 	}
 }
+
+// A reserved header flag is refused, and the case that matters is a caller who
+// sets one *and computes its tags over it* — not a tampered byte.
+//
+// Tampering was never the risk: both tags cover the header as it arrived, so a
+// bit flipped in transit changes the tag input and fails on its own. What this
+// closes is a one-way door. Before the check, a datagram like the ones below
+// verified and was admitted, because nothing looked at the bit; deployed
+// servers would then have been accepting these bits with no meaning attached,
+// and a later envelope version could not have given them one — it could not
+// tell a peer asserting a new flag from an older peer that set the bit for no
+// reason.
+func TestReservedHeaderFlagIsRefusedEvenWhenTheTagsAgree(t *testing.T) {
+	srv, cli := pair(t, EnvelopeV4, []uint8{EnvelopeV4})
+
+	// Built by hand so the header carrying the reserved bit is the same header
+	// both tags are computed over. buildInitial derives its own header and
+	// could not produce this.
+	build := func(h uint8) []byte {
+		buf := initialDatagram()
+		buf = append(buf, cli.clientPubKey...)
+		var ts [4]byte
+		binary.BigEndian.PutUint32(ts[:], NowTimestamp())
+		buf = append(buf, ts[:]...)
+		// Both tags cover exactly this range. Appending the gate first would
+		// fold it into MAC1's input, which is not what either side computes.
+		gate := ComputeGate(h, cli.gateKey[:], buf)
+		mac1 := ComputeMAC1(h, cli.sharedSecret, buf)
+		buf = append(buf, gate...)
+		buf = append(buf, mac1...)
+		return append(buf, h)
+	}
+
+	for _, bit := range []uint8{0x02, 0x04, 0x08} {
+		env := build(Hdr(EnvelopeV4, false) | bit)
+		if ok, _ := srv.validateAndStrip(env, len(env), nil); ok {
+			t.Errorf("reserved bit %#02x was admitted on an envelope whose tags agree with it", bit)
+		}
+	}
+
+	// The control. The identical construction with no reserved bit is accepted,
+	// so the refusals above are about the flag and not about the hand-built
+	// envelope being wrong in some other way.
+	env := build(Hdr(EnvelopeV4, false))
+	ok, n := srv.validateAndStrip(env, len(env), nil)
+	if !ok {
+		t.Fatal("the same envelope without a reserved bit was refused too — the fixture is wrong, so the refusals above prove nothing")
+	}
+	if n != len(env)-TrailerAnon {
+		t.Errorf("stripped to %d bytes, want %d", n, len(env)-TrailerAnon)
+	}
+}

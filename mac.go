@@ -53,6 +53,22 @@ const (
 	// key (SIP-3).
 	FlagIdentity = 0x01
 
+	// FlagReserved is the header's remaining flag bits, which no version
+	// defines a meaning for.
+	//
+	// Refused rather than ignored, because ignoring them is a one-way door.
+	// Both tags cover the header byte as it arrived, so a client that sets a
+	// reserved bit and computes its tags over it would otherwise be admitted —
+	// the tags verify, and nothing else looks at the bit. Deployed servers
+	// would then be accepting these bits with no meaning attached, and a later
+	// version could not give them one: it would have no way to tell a peer
+	// asserting the new flag from an older peer that set the bit for no reason.
+	//
+	// Tampering in transit was never the risk — a flipped bit changes the tag
+	// input and fails. The risk is to the protocol's own future, and closing it
+	// costs nothing only while none of the bits are wanted.
+	FlagReserved = 0x0E
+
 	// TrailerAnon is the trailer width for an anonymous caller: X25519,
 	// timestamp, gate, MAC1, header.
 	TrailerAnon = ClientKeySize + TimestampSize + GateSize + MACSize + HdrSize
@@ -100,6 +116,9 @@ func HdrHasIdentity(hdr uint8) bool {
 // that a receiver finds at the end of the datagram.
 func TrailerLen(hdr uint8) (int, bool) {
 	if HdrVersion(hdr) != EnvelopeV4 {
+		return 0, false
+	}
+	if hdr&FlagReserved != 0 {
 		return 0, false
 	}
 	if HdrHasIdentity(hdr) {
