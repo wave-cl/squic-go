@@ -5,6 +5,51 @@ on:
   pull_request:
 
 jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No module cache: nothing is downloaded, built or tested here. gofmt
+      # only parses.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # Two things this job must get right, both of which a shorter version
+      # gets wrong.
+      #
+      # `gofmt -l` exits **0 whether or not anything is unformatted** — it
+      # reports by listing filenames, not by its status. So the obvious step,
+      # `run: gofmt -l .`, is green on every possible input: it would print the
+      # offending files and pass anyway. Verified by appending a deliberately
+      # mangled function and watching `gofmt -l .` name the file and still exit
+      # 0. The check therefore has to be on the output.
+      #
+      # And `-s` is deliberately not enforced. It rewrites code rather than
+      # layout — dropping redundant types from composite literals, shortening
+      # slice expressions — which is a separate decision from formatting, the
+      # same reason clippy and rustfmt are separate jobs on the Rust side. It
+      # currently reports nothing anyway.
+      #
+      # Nothing here needs the scoping that every Rust fmt job in this estate
+      # carries: gofmt walks file paths rather than a dependency graph, and
+      # this module has no `replace` directives and no vendor tree, so there is
+      # no way for it to reach another repository.
+      - name: Format
+        run: |
+          total=$(find . -name '*.go' -not -path './.git/*' | wc -l | tr -d ' ')
+          test "$total" -gt 0
+          echo "checking $total .go files"
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "::error::not gofmt-clean:"
+            echo "$out"
+            exit 1
+          fi
+          echo "all $total files are gofmt-clean"
+
   test:
     runs-on: ubuntu-latest
     steps:
