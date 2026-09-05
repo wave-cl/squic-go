@@ -259,7 +259,7 @@ type clientConn struct {
 	advertiseEd25519 []byte           // SIP-3: 32-byte Ed25519 identity to assert, or 32 zero bytes
 	envelopeVersion  uint8            // SIP-29: the envelope version this client emits
 	serverAddr       *net.UDPAddr     // the address dialled; a cookie reply from anywhere else is not ours
-	mac0Key          [32]byte         // keys MAC0 (envelope v3); derived from the server's public key
+	gateKey          [32]byte         // keys MAC0 (envelope v3); derived from the server's public key
 	cookieKey        [32]byte         // decrypts cookie replies; derived from the server's public key
 	handshakeDone    atomic.Bool      // true after first non-cookie packet; skips the cookie scan
 	cookie           atomic.Value     // decrypted 16-byte cookie from the server, keys MAC2
@@ -279,7 +279,7 @@ type sentInitial struct {
 	addr     *net.UDPAddr
 }
 
-func newClientConn(conn *net.UDPConn, sharedSecret, clientX25519Pub, advertiseEd25519 []byte, serverAddr *net.UDPAddr, mac0Key, cookieKey [32]byte, envelopeVersion uint8) *clientConn {
+func newClientConn(conn *net.UDPConn, sharedSecret, clientX25519Pub, advertiseEd25519 []byte, serverAddr *net.UDPAddr, gateKey, cookieKey [32]byte, envelopeVersion uint8) *clientConn {
 	// Always a 32-byte field so the client's MAC1 input and the bytes on the
 	// wire match what the server reads and hashes (all zeros = no identity).
 	if len(advertiseEd25519) != Ed25519Size {
@@ -292,7 +292,7 @@ func newClientConn(conn *net.UDPConn, sharedSecret, clientX25519Pub, advertiseEd
 		advertiseEd25519: advertiseEd25519,
 		envelopeVersion:  envelopeVersion,
 		serverAddr:       serverAddr,
-		mac0Key:          mac0Key,
+		gateKey:          gateKey,
 		cookieKey:        cookieKey,
 	}
 }
@@ -304,7 +304,7 @@ func newClientConn(conn *net.UDPConn, sharedSecret, clientX25519Pub, advertiseEd
 // key we expect, so it is dropped and any cookie we already had is kept.
 func (c *clientConn) storeCookie(payload []byte) bool {
 	plain, ok := DecryptCookie(c.cookieKey, payload)
-	if !ok || len(plain) != MAC2Size {
+	if !ok || len(plain) != CookieSize {
 		return false
 	}
 
@@ -562,65 +562,55 @@ func (c *clientConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 
 // buildInitial constructs the Initial packet with MAC1 + MAC2 appended.
 func (c *clientConn) buildInitial(p []byte) []byte {
-	ts := NowTimestamp()
-	nonce, _ := GenerateNonce()
-
-	// An unknown version has no defined trailer. Dial refuses one before a
-	// clientConn is ever built, so this is unreachable — but the old fallback
-	// took version 1's width (108) and then wrote the marker at offset 108
-	// anyway, one past the end of a buffer sized for it, which is a panic
-	// rather than a bad packet. Fall back to version 1 *entirely*, marker
-	// included, so the worst case is an envelope a server will drop.
-	version := c.envelopeVersion
-	trailer, ok := TrailerLen(version)
-	if !ok {
-		version = EnvelopeV1
-		trailer = MACOverhead
+	// An identity is carried only when there is one to carry. The header byte
+	// says which, so the server knows the trailer's width before it parses
+	// anything.
+	hasIdentity := false
+	for _, b := range c.advertiseEd25519 {
+		if b != 0 {
+			hasIdentity = true
+			break
+		}
 	}
-	mac1 := ComputeMAC1(version, c.sharedSecret, p, c.advertiseEd25519, ts, nonce)
+	hdr := Hdr(c.envelopeVersion, hasIdentity)
+	trailer, ok := TrailerLen(hdr)
+	if !ok {
+		// Dial refuses an unknown version before a clientConn is built, so this
+		// is unreachable. Emit the version this build implements rather than a
+		// buffer sized for one layout and written for another, which was a
+		// panic rather than a bad packet.
+		hdr = Hdr(EnvelopeV4, hasIdentity)
+		trailer, _ = TrailerLen(hdr)
+	}
+	ts := NowTimestamp()
 
 	buf := make([]byte, len(p)+trailer)
 	copy(buf, p)
 	off := len(p)
 	copy(buf[off:], c.clientPubKey)
 	off += ClientKeySize
-	copy(buf[off:], c.advertiseEd25519) // SIP-3: Ed25519 identity, or zeros
-	off += Ed25519Size
+	if hasIdentity {
+		copy(buf[off:], c.advertiseEd25519)
+		off += Ed25519Size
+	}
 	binary.BigEndian.PutUint32(buf[off:], ts)
 	off += TimestampSize
-	copy(buf[off:], nonce)
-	off += NonceSize
 
-	// MAC0 (v3): computed over exactly the bytes written so far, which is the
-	// contiguous range the server hashes.
-	if HasMAC0(version) {
-		copy(buf[off:], ComputeMAC0(version, c.mac0Key, buf[:off]))
-		off += MAC0Size
+	// Both tags cover exactly the bytes written so far, which is the contiguous
+	// range the server hashes. The gate's key is the whole difference between
+	// the two modes: the cookie when we hold one, the server's public key
+	// otherwise.
+	gateKey := c.gateKey[:]
+	if held, ok := c.cookie.Load().([]byte); ok && held != nil {
+		gateKey = held
 	}
+	copy(buf[off:], ComputeGate(hdr, gateKey, buf[:off]))
+	gateEnd := off + GateSize
+	copy(buf[gateEnd:], ComputeMAC1(hdr, c.sharedSecret, buf[:off]))
 
-	copy(buf[off:], mac1)
-	off += MACSize
-
-	// MAC2: zeros if no cookie, computed if the server has sent us one.
-	//
-	// The server verifies over everything up to but NOT including mac1,
-	// passing mac1 separately, so the slice here has to stop short of the mac1
-	// just written. Covering buf[:off] folds mac1 in twice and never verifies.
-	if cookie, ok := c.cookie.Load().([]byte); ok && len(cookie) > 0 {
-		mac2 := ComputeMAC2(cookie, buf[:off-MACSize], mac1)
-		copy(buf[off:], mac2)
-	}
-	// else: MAC2 field is already zeros from make()
-	off += MAC2Size
-
-	// SIP-29: the marker goes last, after MAC2, because that is the only offset
-	// a receiver can find without already knowing the trailer's width. Version 1
-	// predates it and emits nothing, which is what keeps this client able to
-	// talk to a server that has not moved yet.
-	if version != EnvelopeV1 {
-		buf[off] = version
-	}
-
+	// SIP-29: the header goes last, because that is the only offset a receiver
+	// can find without already knowing the trailer's width.
+	buf[len(buf)-1] = hdr
 	return buf
 }
 
@@ -657,7 +647,7 @@ type serverConn struct {
 	allowedKeys      map[[32]byte]bool // optional whitelist of client X25519 public keys
 	batchReader      *ipv4.PacketConn  // lazy-initialized for ReadBatch
 
-	mac0Key [32]byte // keys MAC0 (envelope v3); derived from our public key
+	gateKey [32]byte // keys MAC0 (envelope v3); derived from our public key
 	// MAC2 + cookie DDoS protection
 	cookieKey        [32]byte     // encrypts cookie replies; derived from our public key
 	secretsMu        sync.RWMutex // protects the two rotating secrets below
@@ -702,7 +692,7 @@ func newServerConn(conn *net.UDPConn, serverX25519Priv []byte, allowedKeys [][]b
 
 	serverPub := x25519Public(serverX25519Priv)
 	sc.cookieKey = CookieKey(serverPub)
-	sc.mac0Key = MAC0Key(serverPub)
+	sc.gateKey = GateKey(serverPub)
 
 	// The previous secret starts out equal to the current one rather than
 	// random: until the first rotation there is no earlier secret, and seeding
@@ -944,32 +934,18 @@ func (c *serverConn) validateAndStrip(p []byte, n int, addr *net.UDPAddr) (bool,
 		return true, n
 	}
 
-	marked := p[n-1]
-	challenge := false
-
-	// A marked version, if we accept it and it is not the unmarked one.
-	if marked != EnvelopeV1 && c.accepts(marked) {
-		switch res, quicLen := c.tryVersion(marked, p, n, addr); res {
-		case outcomeAccepted:
-			return true, quicLen
-		case outcomeChallenge:
-			challenge = true
+	// One version, so one layout: read the header byte and validate. The
+	// guessing this replaced — try the marked version, then try unmarked v1 —
+	// is what let a single datagram be parsed twice, and with it buy two curve
+	// operations from a server that had accepted the older versions.
+	hdr := p[n-1]
+	switch res, quicLen := c.validateEnvelope(hdr, p, n, addr); res {
+	case outcomeAccepted:
+		return true, quicLen
+	case outcomeChallenge:
+		if addr != nil {
+			c.sendCookieReply(addr)
 		}
-	}
-
-	// Then the unmarked form, which is the only version that needs guessing.
-	if c.accepts(EnvelopeV1) {
-		switch res, quicLen := c.tryVersion(EnvelopeV1, p, n, addr); res {
-		case outcomeAccepted:
-			return true, quicLen
-		case outcomeChallenge:
-			challenge = true
-		}
-	}
-
-	// At most one challenge per datagram, however many layouts were tried.
-	if challenge && addr != nil {
-		c.sendCookieReply(addr)
 	}
 	return false, 0
 }
@@ -984,9 +960,15 @@ func (c *serverConn) accepts(version uint8) bool {
 	return false
 }
 
-// tryVersion validates one Initial under one envelope version.
-func (c *serverConn) tryVersion(version uint8, p []byte, n int, addr *net.UDPAddr) (outcome, int) {
-	trailer, known := TrailerLen(version)
+// validateEnvelope validates one Initial.
+//
+// Returns outcomeChallenge rather than sending the cookie reply itself, so the
+// caller owns the one-reply-per-datagram rule.
+func (c *serverConn) validateEnvelope(hdr uint8, p []byte, n int, addr *net.UDPAddr) (outcome, int) {
+	if !c.accepts(HdrVersion(hdr)) {
+		return outcomeDrop, 0
+	}
+	trailer, known := TrailerLen(hdr)
 	if !known || n <= trailer {
 		return outcomeDrop, 0
 	}
@@ -995,79 +977,63 @@ func (c *serverConn) tryVersion(version uint8, p []byte, n int, addr *net.UDPAdd
 	off := quicLen
 	clientPub := p[off : off+ClientKeySize]
 	off += ClientKeySize
-	edField := p[off : off+Ed25519Size]
-	off += Ed25519Size
+	// SIP-3: carried only when the header says so. Version 3 sent 32 zero bytes
+	// on every anonymous Initial to say the same thing.
+	var edField []byte
+	if HdrHasIdentity(hdr) {
+		edField = p[off : off+Ed25519Size]
+		off += Ed25519Size
+	}
 	tsBytes := p[off : off+TimestampSize]
 	off += TimestampSize
-	nonce := p[off : off+NonceSize]
-	off += NonceSize
-	// MAC0 covers everything up to here, contiguously.
-	mac0End := off
-	var mac0 []byte
-	if HasMAC0(version) {
-		mac0 = p[off : off+MAC0Size]
-		off += MAC0Size
-	}
-	mac1Start := off
+	// Both tags cover exactly this range, contiguously from offset 0.
+	covered := p[:off]
+	gate := p[off : off+GateSize]
+	off += GateSize
 	mac1 := p[off : off+MACSize]
-	off += MACSize
-	mac2 := p[off : off+MAC2Size]
 	timestamp := binary.BigEndian.Uint32(tsBytes)
 
-	// Step 1: Replay protection — reject timestamps outside window (cheap)
+	// Step 1: replay window (cheap)
 	if !TimestampInWindow(timestamp, NowTimestamp()) {
 		return outcomeDrop, 0
 	}
 
-	// Step 2: MAC0 — the cheap gate (envelope v3).
+	// Step 2: the gate — one HMAC, before any curve operation.
 	//
-	// This is the step that makes the cookie defence below silent. MAC1 is a
-	// Diffie-Hellman, so without something cheap in front of it a server cannot
-	// tell a caller who knows its public key from a stranger, and must
-	// therefore challenge both — which is how a server under load ends up
-	// answering everybody. MAC0 costs one HMAC and settles that question before
-	// the challenge is issued, and before the curve operation, so rubbish never
-	// reaches either.
-	//
-	// Versions 1 and 2 carry no MAC0 and skip this. A caller on those versions
-	// is still challenged without proving anything, so this closes the hole
-	// only for v3 traffic — and closes it outright once a deployment retires
-	// the older versions.
-	if mac0 != nil && !VerifyMAC0(version, c.mac0Key, p[:mac0End], mac0) {
-		return outcomeDrop, 0
-	}
-
-	// Step 3: MAC2 check — if under load, require valid MAC2
+	// MAC1 is a Diffie-Hellman, so without something cheap in front of it a
+	// server cannot tell a caller who knows its public key from a stranger, and
+	// must challenge both — which is how a server under load ends up answering
+	// everybody. The gate settles that question first.
 	if c.underLoad.Load() {
-		isZero := true
-		for _, b := range mac2 {
-			if b != 0 {
-				isZero = false
-				break
-			}
-		}
-
-		mac2Valid := false
-		if !isZero && addr != nil {
-			// Recompute deterministic cookie for this IP, verify MAC2
-			// Try current secret, then previous (for rotation grace)
-			dataBeforeMAC2 := p[:mac1Start]
-			current, previous := c.cookieSecrets()
-			cookie := CookieValue(current, addr.IP)
-			if VerifyMAC2(cookie, dataBeforeMAC2, mac1, mac2) {
-				mac2Valid = true
-			} else {
-				cookie = CookieValue(previous, addr.IP)
-				if VerifyMAC2(cookie, dataBeforeMAC2, mac1, mac2) {
-					mac2Valid = true
-				}
-			}
-		}
-
-		if mac2Valid {
+		// Three outcomes, and the middle one is the whole of SIP-37:
+		//
+		//   cookie-keyed   proves the key *and* the address. Accept.
+		//   key-keyed      proves the key but not the address. Challenge — this
+		//                  caller is worth a 57-byte reply, and the reply tells
+		//                  them nothing they did not already know, since they
+		//                  demonstrated the key to get here.
+		//   neither        proves nothing. Silence.
+		//
+		// Challenging on a failed cookie check alone would answer strangers
+		// too, which is the defect MAC0 was added to close: a server under load
+		// that replies to anyone has stopped being silent exactly when it
+		// matters most.
+		switch {
+		case addr != nil && c.gateMatchesCookie(hdr, covered, gate, addr.IP):
 			c.mac2Verified.Add(1)
-		} else {
+		case VerifyGate(hdr, c.gateKey[:], covered, gate):
 			return outcomeChallenge, 0
+		default:
+			return outcomeDrop, 0
+		}
+	} else {
+		// The public-key form, then the cookie: a client that answered a
+		// challenge during an earlier burst still holds one, and should not be
+		// made to re-handshake because the load subsided. Two HMACs at worst,
+		// still far below one X25519.
+		if !VerifyGate(hdr, c.gateKey[:], covered, gate) &&
+			!(addr != nil && c.gateMatchesCookie(hdr, covered, gate, addr.IP)) {
+			return outcomeDrop, 0
 		}
 	}
 
@@ -1090,7 +1056,7 @@ func (c *serverConn) tryVersion(version uint8, p []byte, n int, addr *net.UDPAdd
 		return outcomeDrop, 0
 	}
 
-	if !VerifyMAC1(version, shared, p[:quicLen], edField, timestamp, nonce, mac1) {
+	if !VerifyMAC1(hdr, shared, covered, mac1) {
 		return outcomeDrop, 0
 	}
 
@@ -1134,10 +1100,24 @@ func (c *serverConn) tryVersion(version uint8, p []byte, n int, addr *net.UDPAdd
 		c.peers.record(dcid, key, identity, hasIdentity, time.Now())
 	}
 
-	if i, ok := VersionIndex(version); ok {
+	if i, ok := VersionIndex(HdrVersion(hdr)); ok {
 		c.accepted[i].Add(1)
 	}
 	return outcomeAccepted, quicLen
+}
+
+// gateMatchesCookie reports whether gate verifies under the cookie for ip,
+// trying the current secret and then the previous one.
+//
+// Two secrets because they rotate on a timer: a caller that answered a
+// challenge seconds before a rotation holds a cookie derived from the older
+// one, and refusing it would turn a routine rotation into a failed handshake.
+func (c *serverConn) gateMatchesCookie(hdr uint8, covered []byte, gate []byte, ip net.IP) bool {
+	current, previous := c.cookieSecrets()
+	if VerifyGate(hdr, CookieValue(current, ip), covered, gate) {
+		return true
+	}
+	return VerifyGate(hdr, CookieValue(previous, ip), covered, gate)
 }
 
 // addKey adds a client public key to the whitelist.

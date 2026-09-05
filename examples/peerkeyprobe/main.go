@@ -44,7 +44,7 @@ func main() {
 	clientKey := flag.String("client-key", "", "client Ed25519 seed (hex), client mode")
 	advertise := flag.Bool("advertise", false, "advertise the client Ed25519 identity (SIP-3)")
 	underLoad := flag.Bool("under-load", false, "server: demand a cookie from every caller (SIP-7)")
-	envelopeVersion := flag.Int("envelope-version", 1, "client: envelope version to emit (SIP-29)")
+	envelopeVersion := flag.Int("envelope-version", 4, "client: envelope version to emit (SIP-29)")
 	flag.Parse()
 
 	switch {

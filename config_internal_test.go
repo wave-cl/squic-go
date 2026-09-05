@@ -46,7 +46,7 @@ func TestZeroThresholdStartsNoCookieMachinery(t *testing.T) {
 	priv := make([]byte, 32)
 	copy(priv, pub)
 
-	sc := newServerConn(nil, priv, nil, 0, []uint8{EnvelopeV1, EnvelopeV2})
+	sc := newServerConn(nil, priv, nil, 0, []uint8{EnvelopeV4})
 	if sc.loadThreshold != 0 {
 		t.Fatalf("loadThreshold = %d, want 0", sc.loadThreshold)
 	}
@@ -79,13 +79,13 @@ func TestAnswerChallengeRetransmitsImmediately(t *testing.T) {
 
 	var cookieKey [32]byte
 	rand.Read(cookieKey[:])
-	var mac0Key [32]byte
-	rand.Read(mac0Key[:])
-	c := newClientConn(local, make([]byte, 32), make([]byte, 32), nil, peer.LocalAddr().(*net.UDPAddr), mac0Key, cookieKey, EnvelopeV1)
+	var gateKey [32]byte
+	rand.Read(gateKey[:])
+	c := newClientConn(local, make([]byte, 32), make([]byte, 32), nil, peer.LocalAddr().(*net.UDPAddr), gateKey, cookieKey, EnvelopeV4)
 
 	// A cookie arriving before anything has been sent must not panic and must
 	// not invent a packet.
-	cookie := make([]byte, MAC2Size)
+	cookie := make([]byte, CookieSize)
 	rand.Read(cookie)
 	sealed, err := EncryptCookie(cookieKey, cookie)
 	if err != nil {
@@ -110,7 +110,7 @@ func TestAnswerChallengeRetransmitsImmediately(t *testing.T) {
 	// retransmission: buildInitial stamps the stored cookie onto every Initial,
 	// so a second copy of it has nothing to add. That rule has its own test
 	// below; this one is about a new challenge being answered at once.
-	fresh := make([]byte, MAC2Size)
+	fresh := make([]byte, CookieSize)
 	rand.Read(fresh)
 	sealedFresh, err := EncryptCookie(cookieKey, fresh)
 	if err != nil {
@@ -124,7 +124,7 @@ func TestAnswerChallengeRetransmitsImmediately(t *testing.T) {
 	if err != nil {
 		t.Fatalf("no Initial resent after the cookie was stored: %v", err)
 	}
-	if want := len(datagram) + MACOverhead; n != want {
+	if want := len(datagram) + TrailerAnon; n != want {
 		t.Fatalf("resent %d bytes, want %d (datagram plus MAC envelope)", n, want)
 	}
 	if !isQUICInitial(buf[:n]) {
@@ -132,31 +132,24 @@ func TestAnswerChallengeRetransmitsImmediately(t *testing.T) {
 	}
 }
 
-// SIP-29's Sending rule in two parts. A release that introduces a version ships
-// clients still sending the previous one, so upgrading a client before a server
-// cannot break anything; a later release moves the default once servers have
-// deployed. This is that later release, so the default is version 2 — and a
-// server still accepts version 1, because retiring it is a separate decision a
-// deployment makes for itself.
-func TestClientDefaultIsVersion3AndServersStillAcceptTheOlderOnes(t *testing.T) {
+// One version, and the default accept-set is that same version.
+//
+// The second audit measured why this matters: with [1, 2, 3] as the shipped
+// default, a junk datagram bought a curve operation, because versions 1 and 2
+// carried no cheap gate for the server to check. A default that admits a weaker
+// envelope than the client sends undoes the gate entirely.
+func TestTheOnlyVersionIsFourAndItIsTheDefaultOnBothSides(t *testing.T) {
 	for _, cfg := range []*Config{nil, {}} {
-		if got := cfg.envelopeVersion(); got != EnvelopeV3 {
-			t.Fatalf("client default = %d, want %d", got, EnvelopeV3)
+		if got := cfg.envelopeVersion(); got != EnvelopeV4 {
+			t.Fatalf("client default = %d, want %d", got, EnvelopeV4)
 		}
-		// A server upgraded to this release still serves the clients that have
-		// not moved. Retiring the older versions is a deployment's own
-		// decision, and the thing that finally makes the cookie stage silent
-		// (SIP-37).
 		accepted := cfg.acceptedEnvelopeVersions()
-		for _, want := range []uint8{EnvelopeV1, EnvelopeV2, EnvelopeV3} {
-			var saw bool
-			for _, v := range accepted {
-				saw = saw || v == want
-			}
-			if !saw {
-				t.Fatalf("server default accepts %v, missing version %d", accepted, want)
-			}
+		if len(accepted) != 1 || accepted[0] != EnvelopeV4 {
+			t.Fatalf("server default accepts %v, want [%d]", accepted, EnvelopeV4)
 		}
+	}
+	if len(EnvelopeVersions) != 1 || EnvelopeVersions[0] != EnvelopeV4 {
+		t.Fatalf("EnvelopeVersions = %v, want [%d]", EnvelopeVersions, EnvelopeV4)
 	}
 }
 
@@ -181,11 +174,11 @@ func TestCookieReplyFromAStrangerIsIgnored(t *testing.T) {
 	}
 	defer stranger.Close()
 
-	var cookieKey, mac0Key [32]byte
+	var cookieKey, gateKey [32]byte
 	rand.Read(cookieKey[:])
-	rand.Read(mac0Key[:])
+	rand.Read(gateKey[:])
 	c := newClientConn(local, make([]byte, 32), make([]byte, 32), nil,
-		peer.LocalAddr().(*net.UDPAddr), mac0Key, cookieKey, EnvelopeV1)
+		peer.LocalAddr().(*net.UDPAddr), gateKey, cookieKey, EnvelopeV4)
 
 	datagram := make([]byte, 1200)
 	datagram[0] = 0xC0
@@ -200,7 +193,7 @@ func TestCookieReplyFromAStrangerIsIgnored(t *testing.T) {
 	}
 
 	// Drive the read path with a reply the stranger minted.
-	cookie := make([]byte, MAC2Size)
+	cookie := make([]byte, CookieSize)
 	rand.Read(cookie)
 	sealed, err := EncryptCookie(cookieKey, cookie)
 	if err != nil {
@@ -239,11 +232,11 @@ func TestOneInitialEarnsOneAnsweredChallenge(t *testing.T) {
 	}
 	defer local.Close()
 
-	var cookieKey, mac0Key [32]byte
+	var cookieKey, gateKey [32]byte
 	rand.Read(cookieKey[:])
-	rand.Read(mac0Key[:])
+	rand.Read(gateKey[:])
 	c := newClientConn(local, make([]byte, 32), make([]byte, 32), nil,
-		peer.LocalAddr().(*net.UDPAddr), mac0Key, cookieKey, EnvelopeV1)
+		peer.LocalAddr().(*net.UDPAddr), gateKey, cookieKey, EnvelopeV4)
 
 	datagram := make([]byte, 1200)
 	datagram[0] = 0xC0
@@ -251,7 +244,7 @@ func TestOneInitialEarnsOneAnsweredChallenge(t *testing.T) {
 	c.rememberInitial(datagram, peer.LocalAddr().(*net.UDPAddr))
 
 	for i := 0; i < 10; i++ {
-		cookie := make([]byte, MAC2Size)
+		cookie := make([]byte, CookieSize)
 		rand.Read(cookie)
 		sealed, err := EncryptCookie(cookieKey, cookie)
 		if err != nil {
@@ -289,16 +282,16 @@ func TestRepeatedCookieEarnsNoFurtherAnswer(t *testing.T) {
 	}
 	defer local.Close()
 
-	var cookieKey, mac0Key [32]byte
+	var cookieKey, gateKey [32]byte
 	rand.Read(cookieKey[:])
-	rand.Read(mac0Key[:])
+	rand.Read(gateKey[:])
 	c := newClientConn(local, make([]byte, 32), make([]byte, 32), nil,
-		peer.LocalAddr().(*net.UDPAddr), mac0Key, cookieKey, EnvelopeV1)
+		peer.LocalAddr().(*net.UDPAddr), gateKey, cookieKey, EnvelopeV4)
 
 	datagram := make([]byte, 1200)
 	datagram[0] = 0xC0
 	binary.BigEndian.PutUint32(datagram[1:5], uint32(quic.Version1))
-	cookie := make([]byte, MAC2Size)
+	cookie := make([]byte, CookieSize)
 	rand.Read(cookie)
 	sealed, err := EncryptCookie(cookieKey, cookie)
 	if err != nil {
@@ -335,19 +328,19 @@ func TestUnknownEnvelopeVersionDoesNotPanic(t *testing.T) {
 	}
 	defer local.Close()
 
-	var cookieKey, mac0Key [32]byte
+	var cookieKey, gateKey [32]byte
 	rand.Read(cookieKey[:])
-	rand.Read(mac0Key[:])
+	rand.Read(gateKey[:])
 
 	for _, v := range []uint8{0, 4, 7, 255} {
 		c := newClientConn(local, make([]byte, 32), make([]byte, 32), nil,
-			local.LocalAddr().(*net.UDPAddr), mac0Key, cookieKey, v)
+			local.LocalAddr().(*net.UDPAddr), gateKey, cookieKey, v)
 		datagram := make([]byte, 1200)
 		datagram[0] = 0xC0
 		binary.BigEndian.PutUint32(datagram[1:5], uint32(quic.Version1))
 
 		buf := c.buildInitial(datagram) // must not panic
-		if want := len(datagram) + MACOverhead; len(buf) != want {
+		if want := len(datagram) + TrailerAnon; len(buf) != want {
 			t.Errorf("version %d: built %d bytes, want %d (the version 1 envelope)", v, len(buf), want)
 		}
 	}

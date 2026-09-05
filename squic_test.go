@@ -23,57 +23,40 @@ func TestMAC1RoundTrip(t *testing.T) {
 	sharedSecret := make([]byte, 32)
 	rand.Read(sharedSecret)
 
-	data := []byte("test packet data")
-	ed := make([]byte, squic.Ed25519Size)
-	for i := range ed {
-		ed[i] = 0x11
-	}
-	ts := squic.NowTimestamp()
-	nonce, _ := squic.GenerateNonce()
-	mac := squic.ComputeMAC1(squic.EnvelopeV1, sharedSecret, data, ed, ts, nonce)
+	hdr := squic.Hdr(squic.EnvelopeV4, false)
+	// The covered range as it appears on the wire: datagram, client key,
+	// [identity], timestamp. One slice, because both tags cover the same bytes.
+	covered := []byte("test packet data + client key + ts")
+	mac := squic.ComputeMAC1(hdr, sharedSecret, covered)
 
 	if len(mac) != squic.MACSize {
 		t.Fatalf("MAC1 length = %d, want %d", len(mac), squic.MACSize)
 	}
-
-	// Verify MAC1
-	if !squic.VerifyMAC1(squic.EnvelopeV1, sharedSecret, data, ed, ts, nonce, mac) {
+	if !squic.VerifyMAC1(hdr, sharedSecret, covered, mac) {
 		t.Error("valid MAC1 failed verification")
 	}
 
 	// Wrong key should fail
 	wrongKey := make([]byte, 32)
 	rand.Read(wrongKey)
-	if squic.VerifyMAC1(squic.EnvelopeV1, wrongKey, data, ed, ts, nonce, mac) {
+	if squic.VerifyMAC1(hdr, wrongKey, covered, mac) {
 		t.Error("MAC1 should fail with wrong key")
 	}
 
-	// Tampered data should fail
-	tampered := make([]byte, len(data))
-	copy(tampered, data)
-	tampered[0] ^= 0xFF
-	if squic.VerifyMAC1(squic.EnvelopeV1, sharedSecret, tampered, ed, ts, nonce, mac) {
-		t.Error("MAC1 should fail with tampered data")
+	// Any byte of the covered range, tampered, should fail — the identity
+	// field and the timestamp are inside it (SIP-3, SIP-6).
+	for _, i := range []int{0, len(covered) / 2, len(covered) - 1} {
+		tampered := append([]byte(nil), covered...)
+		tampered[i] ^= 0xFF
+		if squic.VerifyMAC1(hdr, sharedSecret, tampered, mac) {
+			t.Errorf("MAC1 should fail with byte %d tampered", i)
+		}
 	}
 
-	// Tampered Ed25519 identity field should fail (SIP-3: it is in the MAC1 input)
-	ed2 := make([]byte, squic.Ed25519Size)
-	copy(ed2, ed)
-	ed2[0] ^= 0xFF
-	if squic.VerifyMAC1(squic.EnvelopeV1, sharedSecret, data, ed2, ts, nonce, mac) {
-		t.Error("MAC1 should fail with tampered Ed25519 field")
-	}
-
-	// Wrong timestamp should fail
-	if squic.VerifyMAC1(squic.EnvelopeV1, sharedSecret, data, ed, ts+1, nonce, mac) {
-		t.Error("MAC1 should fail with different timestamp")
-	}
-
-	// Wrong nonce should fail
-	wrongNonce := make([]byte, squic.NonceSize)
-	rand.Read(wrongNonce)
-	if squic.VerifyMAC1(squic.EnvelopeV1, sharedSecret, data, ed, ts, wrongNonce, mac) {
-		t.Error("MAC1 should fail with different nonce")
+	// A different header must not verify: it is prefixed, so tags under
+	// different versions or flags are unrelated (SIP-29).
+	if squic.VerifyMAC1(squic.Hdr(squic.EnvelopeV4, true), sharedSecret, covered, mac) {
+		t.Error("MAC1 should fail with a different header byte")
 	}
 }
 
@@ -284,7 +267,7 @@ func TestSilentServerDropsInvalidMAC(t *testing.T) {
 	rand.Read(fakeClientPub)
 	fakeMAC := make([]byte, squic.MACSize)
 	rand.Read(fakeMAC)
-	buf := make([]byte, len(garbage)+squic.MACOverhead)
+	buf := make([]byte, len(garbage)+squic.TrailerAnon)
 	copy(buf, garbage)
 	copy(buf[len(garbage):], fakeClientPub)
 	copy(buf[len(garbage)+squic.ClientKeySize:], fakeMAC)
@@ -502,7 +485,7 @@ func TestWhitelistDHCannotBeForged(t *testing.T) {
 	fakeMAC := make([]byte, squic.MACSize)
 	rand.Read(fakeMAC)
 
-	buf := make([]byte, len(fakePacket)+squic.MACOverhead)
+	buf := make([]byte, len(fakePacket)+squic.TrailerAnon)
 	copy(buf, fakePacket)
 	copy(buf[len(fakePacket):], victimPub)
 	copy(buf[len(fakePacket)+squic.ClientKeySize:], fakeMAC)
@@ -874,10 +857,8 @@ func TestSmallOrderClientKeyIsRefused(t *testing.T) {
 	zeroKey := make([]byte, 32)
 	assumedShared := make([]byte, 32) // the attacker assumes zeros, and is right
 
-	ed := make([]byte, squic.Ed25519Size)
-	ts := squic.NowTimestamp()
-	nonce, _ := squic.GenerateNonce()
-	mac1 := squic.ComputeMAC1(squic.EnvelopeV1, assumedShared, datagram, ed, ts, nonce)
+	hdr := squic.Hdr(squic.EnvelopeV4, false)
+	mac1 := squic.ComputeMAC1(hdr, assumedShared, datagram)
 
 	// The exchange the server would perform. If it yields a usable secret
 	// rather than an error, a stranger's MAC1 verifies.

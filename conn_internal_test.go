@@ -38,7 +38,7 @@ func testServerConn(t *testing.T) (*serverConn, *net.UDPConn) {
 	if err != nil {
 		t.Fatalf("ListenUDP: %v", err)
 	}
-	return newServerConn(conn, Ed25519PrivateToX25519(priv), nil, 1000, []uint8{EnvelopeV1, EnvelopeV2}), conn
+	return newServerConn(conn, Ed25519PrivateToX25519(priv), nil, 1000, []uint8{EnvelopeV4}), conn
 }
 
 // A long header carrying a version quic-go does not parse must be dropped by
@@ -118,7 +118,7 @@ func floodChild() {
 		panic(err)
 	}
 	defer conn.Close()
-	sc := newServerConn(conn, Ed25519PrivateToX25519(priv), nil, 1000, []uint8{EnvelopeV1, EnvelopeV2, EnvelopeV3})
+	sc := newServerConn(conn, Ed25519PrivateToX25519(priv), nil, 1000, []uint8{EnvelopeV4})
 
 	sender, err := net.DialUDP("udp", nil, conn.LocalAddr().(*net.UDPAddr))
 	if err != nil {
@@ -176,44 +176,41 @@ func floodChild() {
 
 // buildStrangerEnvelope produces everything an attacker can make without the
 // server's public key: a real QUIC v1 header, a timestamp inside the window,
-// and noise for the rest of the envelope.
-func buildStrangerEnvelope(version uint8) []byte {
+// and noise for the rest of the envelope. The gate is the field they cannot
+// produce, which is the whole point of it.
+func buildStrangerEnvelope() []byte {
 	p := probe(0xC0, uint32(quic.Version1), 1200)
 	p[5] = 8 // DCID length
+	hdr := Hdr(EnvelopeV4, false)
 	buf := append([]byte(nil), p...)
 	buf = append(buf, bytes.Repeat([]byte{0x42}, ClientKeySize)...)
-	buf = append(buf, make([]byte, Ed25519Size)...)
 	var ts [4]byte
 	binary.BigEndian.PutUint32(ts[:], NowTimestamp())
 	buf = append(buf, ts[:]...)
-	buf = append(buf, make([]byte, NonceSize)...)
-	if HasMAC0(version) {
-		buf = append(buf, bytes.Repeat([]byte{0x11}, MAC0Size)...) // guessed
-	}
+	buf = append(buf, bytes.Repeat([]byte{0x11}, GateSize)...) // guessed
 	buf = append(buf, bytes.Repeat([]byte{0x22}, MACSize)...)
-	buf = append(buf, bytes.Repeat([]byte{0x33}, MAC2Size)...)
-	if version != EnvelopeV1 {
-		buf = append(buf, version)
-	}
+	buf = append(buf, hdr)
 	return buf
 }
 
-// The S8 finding, and the reason envelope v3 exists.
+// The S8 finding, and the reason the gate exists.
 //
-// Under load the server challenges before it knows who is calling, because MAC1
-// is a Diffie-Hellman and there is nothing cheaper in front of it. So a stranger
-// — no key, no captured traffic — sends something Initial-shaped with a
-// plausible timestamp and gets a cookie reply, which is a server that is
-// supposed to be silent telling them it exists.
+// Under load a server without a cheap check challenges before it knows who is
+// calling, because MAC1 is a Diffie-Hellman and there is nothing cheaper in
+// front of it. So a stranger — no key, no captured traffic — sends something
+// Initial-shaped with a plausible timestamp and gets a cookie reply, which is a
+// server that is supposed to be silent telling them it exists.
 //
-// With v3 the same stranger is dropped at MAC0, before the challenge.
-func TestUnderLoadAStrangerIsNotChallengedOnV3(t *testing.T) {
+// With the gate the same stranger is dropped before the challenge. There is no
+// longer a version that skips it: that was the honest limit of the v3 fix, and
+// removing versions 1 and 2 is what finally closed it.
+func TestUnderLoadAStrangerIsDroppedNotChallenged(t *testing.T) {
 	sc, conn := testServerConn(t)
 	defer conn.Close()
-	sc.acceptedVersions = []uint8{EnvelopeV3}
+	sc.acceptedVersions = []uint8{EnvelopeV4}
 	sc.underLoad.Store(true)
 
-	buf := buildStrangerEnvelope(EnvelopeV3)
+	buf := buildStrangerEnvelope()
 	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40501}
 	if ok, _ := sc.validateAndStrip(buf, len(buf), addr); ok {
 		t.Fatal("a stranger's envelope was admitted")
@@ -223,41 +220,21 @@ func TestUnderLoadAStrangerIsNotChallengedOnV3(t *testing.T) {
 	}
 }
 
-// The honest limit of this fix, pinned so nobody mistakes it for done: a server
-// that still accepts v1 keeps answering strangers on that version, because those
-// envelopes have no MAC0 to check. S8 is closed only when a deployment retires
-// the older versions.
-func TestAV1StrangerIsStillChallengedWhileV1IsAccepted(t *testing.T) {
-	sc, conn := testServerConn(t)
-	defer conn.Close()
-	sc.acceptedVersions = []uint8{EnvelopeV1, EnvelopeV3}
-	sc.underLoad.Store(true)
-
-	buf := buildStrangerEnvelope(EnvelopeV1)
-	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40503}
-	if ok, _ := sc.validateAndStrip(buf, len(buf), addr); ok {
-		t.Fatal("a v1 stranger was admitted")
-	}
-	if n := sc.cookieReplies.Load(); n != 1 {
-		t.Errorf("expected v1 to still leak a challenge (got %d) — if this changed, update SIP-7 and the rollout note", n)
-	}
-}
-
-// A v3 envelope whose MAC0 does not verify is dropped even when the server is
+// An envelope whose gate tag does not verify is dropped even when the server is
 // not under load — the gate is unconditional, so rubbish costs one HMAC rather
 // than a curve operation.
-func TestBadMAC0IsDroppedWithoutADiffieHellman(t *testing.T) {
+func TestABadGateIsDroppedWithoutADiffieHellman(t *testing.T) {
 	sc, conn := testServerConn(t)
 	defer conn.Close()
-	sc.acceptedVersions = []uint8{EnvelopeV3}
+	sc.acceptedVersions = []uint8{EnvelopeV4}
 
-	buf := buildStrangerEnvelope(EnvelopeV3)
+	buf := buildStrangerEnvelope()
 	before := sc.dhCount.Load()
 	if ok, _ := sc.validateAndStrip(buf, len(buf), nil); ok {
-		t.Fatal("an envelope with a bad MAC0 was admitted")
+		t.Fatal("an envelope with a bad gate tag was admitted")
 	}
 	if sc.dhCount.Load() != before {
-		t.Error("a Diffie-Hellman was performed for an envelope that failed MAC0")
+		t.Error("a Diffie-Hellman was performed for an envelope that failed the gate")
 	}
 }
 
@@ -270,12 +247,13 @@ func TestBadMAC0IsDroppedWithoutADiffieHellman(t *testing.T) {
 func TestAcceptedInitialsAreCountedPerEnvelopeVersion(t *testing.T) {
 	sc, conn := testServerConn(t)
 	defer conn.Close()
-	sc.acceptedVersions = []uint8{EnvelopeV1, EnvelopeV2, EnvelopeV3}
+	sc.acceptedVersions = []uint8{EnvelopeV4}
 
 	// A rejected envelope must not be counted as an arrival on the version it
 	// claims, or the number says the opposite of what a reader needs.
 	for _, v := range EnvelopeVersions {
-		buf := buildStrangerEnvelope(v)
+		buf := buildStrangerEnvelope()
+		buf[len(buf)-1] = Hdr(v, false)
 		if ok, _ := sc.validateAndStrip(buf, len(buf), nil); ok {
 			t.Fatalf("a stranger's version %d envelope was admitted", v)
 		}
@@ -302,22 +280,26 @@ func TestAcceptedInitialsAreCountedPerEnvelopeVersion(t *testing.T) {
 	// that rejected envelopes count zero passes just as well with no counter at
 	// all — measured, not assumed: without this the whole test survives
 	// deleting the increment.
-	all := []uint8{EnvelopeV1, EnvelopeV2, EnvelopeV3}
-	srv, cli := pair(t, EnvelopeV2, all)
+	srv, cli := pair(t, EnvelopeV4, []uint8{EnvelopeV4})
 	for i := 0; i < 3; i++ {
 		env := cli.buildInitial(initialDatagram())
 		if ok, _ := srv.validateAndStrip(env, len(env), nil); !ok {
 			t.Fatalf("the matched client's envelope %d was refused", i)
 		}
 	}
-	got := srv.loadStats().AcceptedByVersion
-	if got[EnvelopeV2] != 3 {
-		t.Errorf("version 2 counted %d accepted Initials, want 3", got[EnvelopeV2])
+	if got := srv.loadStats().AcceptedByVersion[EnvelopeV4]; got != 3 {
+		t.Errorf("version %d counted %d accepted Initials, want 3", EnvelopeV4, got)
 	}
-	for _, v := range []uint8{EnvelopeV1, EnvelopeV3} {
-		if got[v] != 0 {
-			t.Errorf("version %d counted %d, want 0 — a version is counting another's traffic", v, got[v])
-		}
+
+	// A stranger's envelope is refused, and must not move the counter — a
+	// rejected Initial counted as an arrival says the opposite of what a reader
+	// needs.
+	stranger := buildStrangerEnvelope()
+	if ok, _ := srv.validateAndStrip(stranger, len(stranger), nil); ok {
+		t.Fatal("a stranger's envelope was admitted")
+	}
+	if got := srv.loadStats().AcceptedByVersion[EnvelopeV4]; got != 3 {
+		t.Errorf("a refused Initial was counted: %d, want 3", got)
 	}
 }
 

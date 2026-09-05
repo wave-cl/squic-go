@@ -218,14 +218,14 @@ func (c *Config) loadThreshold() int64 {
 
 func (c *Config) envelopeVersion() uint8 {
 	if c == nil || c.EnvelopeVersion == 0 {
-		return EnvelopeV3 // unset; see the field comment for the history
+		return EnvelopeV4 // unset; the only version implemented
 	}
 	return c.EnvelopeVersion
 }
 
 func (c *Config) acceptedEnvelopeVersions() []uint8 {
 	if c == nil || len(c.AcceptedEnvelopeVersions) == 0 {
-		return []uint8{EnvelopeV1, EnvelopeV2, EnvelopeV3}
+		return []uint8{EnvelopeV4}
 	}
 	return c.AcceptedEnvelopeVersions
 }
@@ -508,10 +508,10 @@ func Dial(ctx context.Context, addr string, serverPubKey []byte, config *Config)
 	// symptom is a handshake timeout with no hint of the cause — and before
 	// buildInitial was hardened it was an out-of-range panic on the first
 	// Initial.
-	if _, ok := TrailerLen(config.envelopeVersion()); !ok {
+	if _, ok := TrailerLen(Hdr(config.envelopeVersion(), false)); !ok {
 		rawConn.Close()
-		return nil, fmt.Errorf("squic: unknown EnvelopeVersion %d (defined: %d, %d, %d)",
-			config.envelopeVersion(), EnvelopeV1, EnvelopeV2, EnvelopeV3)
+		return nil, fmt.Errorf("squic: unknown EnvelopeVersion %d (defined: %d)",
+			config.envelopeVersion(), EnvelopeV4)
 	}
 
 	// Convert server Ed25519 pubkey to X25519 for DH
@@ -561,7 +561,7 @@ func Dial(ctx context.Context, addr string, serverPubKey []byte, config *Config)
 
 	// Wrap with DH MAC1 appending
 	wrappedConn := newClientConn(rawConn, shared, clientPub, advertiseEd25519, udpAddr,
-		MAC0Key(serverX25519Pub), CookieKey(serverX25519Pub), config.envelopeVersion())
+		GateKey(serverX25519Pub), CookieKey(serverX25519Pub), config.envelopeVersion())
 
 	tlsConf := ClientTLSConfig(serverPubKey)
 	if protos := config.nextProtos(); protos != nil {

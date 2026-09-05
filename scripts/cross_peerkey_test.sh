@@ -74,13 +74,13 @@ run() { # $1=server label $2=server bin  $3=client label $4=client bin  $5=adver
   fi
 }
 
-# The envelope version dimension is SIP-29's. Every server here accepts both
-# versions, which is the transition state the SIP exists to make possible, so
-# the version 1 rows prove an old client still reaches a new server across the
-# implementation boundary, and the version 2 rows prove the two agree on the
-# marker's position and on the version-prefixed MAC1.
+# One envelope version now, so the dimension that mattered is the identity flag:
+# the anonymous rows prove the two agree on the 69-byte trailer, and the
+# advertised rows on the 101-byte one. Both prove they agree on where the header
+# byte sits and on the header prefix in both tags — which is the only thing
+# stopping a wire change from being two implementations quietly disagreeing.
 echo "=== cross-implementation SIP-2 peer-key / SIP-3 peer-identity / SIP-29 envelope test ==="
-for ver in 1 2; do
+for ver in 4; do
   for adv in 0 1; do
     run rust "$RUST" rust "$RUST" "$adv" "$ver"
     run rust "$RUST" go   "$GO"   "$adv" "$ver"

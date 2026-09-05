@@ -1,20 +1,19 @@
 package squic
 
 import (
-	"bytes"
 	"crypto/ed25519"
-	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/binary"
-	"github.com/quic-go/quic-go"
 	"net"
 	"testing"
+
+	"github.com/quic-go/quic-go"
 )
 
-// SIP-29. The marker is the last byte of the datagram because that is the only
+// SIP-29. The header is the last byte of the datagram because that is the only
 // offset a receiver can read without already knowing the trailer's width — and
-// knowing the width is what the marker is for.
+// knowing the width is what the header is for. Under version 4 it carries the
+// identity flag too, so the width is no longer a constant per version.
 
 const testDatagram = 1200
 
@@ -50,7 +49,7 @@ func pair(t *testing.T, clientVersion uint8, serverVersions []uint8) (*serverCon
 	t.Cleanup(func() { cconn.Close() })
 
 	sc := newServerConn(sconn, serverPriv, nil, 0, serverVersions)
-	cc := newClientConn(cconn, shared, clientPub, nil, sconn.LocalAddr().(*net.UDPAddr), MAC0Key(serverPub), CookieKey(serverPub), clientVersion)
+	cc := newClientConn(cconn, shared, clientPub, nil, sconn.LocalAddr().(*net.UDPAddr), GateKey(serverPub), CookieKey(serverPub), clientVersion)
 	return sc, cc
 }
 
@@ -65,238 +64,153 @@ func initialDatagram() []byte {
 	return p
 }
 
-// A version 2 client and a server that accepts version 2 agree on the whole
-// envelope: the marker's position, the trailer's width, and the version prefix
-// in MAC1.
-func TestEnvelopeVersion2RoundTrips(t *testing.T) {
-	sc, cc := pair(t, EnvelopeV2, []uint8{EnvelopeV1, EnvelopeV2})
+// The whole envelope agreed end to end: the header's position, the trailer's
+// width, and the header prefix in both tags.
+func TestEnvelopeVersion4RoundTrips(t *testing.T) {
+	sc, cc := pair(t, EnvelopeV4, []uint8{EnvelopeV4})
 	buf := cc.buildInitial(initialDatagram())
 
-	if len(buf) != testDatagram+MACOverheadV2 {
-		t.Fatalf("envelope is %d bytes, want %d", len(buf), testDatagram+MACOverheadV2)
+	if len(buf) != testDatagram+TrailerAnon {
+		t.Fatalf("envelope is %d bytes, want %d", len(buf), testDatagram+TrailerAnon)
 	}
-	if buf[len(buf)-1] != EnvelopeV2 {
-		t.Fatalf("marker is not the last byte: got %#02x", buf[len(buf)-1])
+	if got := HdrVersion(buf[len(buf)-1]); got != EnvelopeV4 {
+		t.Fatalf("header names version %d, want %d", got, EnvelopeV4)
+	}
+	if HdrHasIdentity(buf[len(buf)-1]) {
+		t.Fatal("an anonymous client set the identity flag")
 	}
 
 	ok, quicLen := sc.validateAndStrip(buf, len(buf), nil)
 	if !ok || quicLen != testDatagram {
-		t.Fatalf("server rejected a version 2 envelope: ok=%v len=%d", ok, quicLen)
+		t.Fatalf("server rejected a version 4 envelope: ok=%v len=%d", ok, quicLen)
 	}
 }
 
-// The transition case, and the reason this SIP is worth having: one server
-// serving both versions at once.
-func TestServerServesBothVersionsAtOnce(t *testing.T) {
-	for _, version := range []uint8{EnvelopeV1, EnvelopeV2} {
-		sc, cc := pair(t, version, []uint8{EnvelopeV1, EnvelopeV2})
+// The 32 bytes version 3 spent on every anonymous Initial.
+func TestAnonymousEnvelopeIsShorterThanOneWithAnIdentity(t *testing.T) {
+	if TrailerWithIdentity-TrailerAnon != Ed25519Size {
+		t.Fatalf("identity costs %d bytes, want %d", TrailerWithIdentity-TrailerAnon, Ed25519Size)
+	}
+	if TrailerAnon != 69 || TrailerWithIdentity != 101 {
+		t.Fatalf("trailer widths are %d and %d, want 69 and 101", TrailerAnon, TrailerWithIdentity)
+	}
+}
+
+// A server refuses a version it does not implement, and says nothing.
+func TestUnimplementedVersionIsDropped(t *testing.T) {
+	sc, cc := pair(t, EnvelopeV4, []uint8{EnvelopeV4})
+	for _, v := range []uint8{1, 2, 3, 5} {
 		buf := cc.buildInitial(initialDatagram())
-		ok, quicLen := sc.validateAndStrip(buf, len(buf), nil)
-		if !ok || quicLen != testDatagram {
-			t.Fatalf("server accepting both refused version %d", version)
+		buf[len(buf)-1] = Hdr(v, false)
+		if ok, _ := sc.validateAndStrip(buf, len(buf), nil); ok {
+			t.Fatalf("server parsed envelope version %d", v)
 		}
 	}
 }
 
-// A version 1 packet's last byte is the last byte of MAC2. With no cookie that
-// is deterministically zero — the reserved version, never a marker — so the
-// collision only arises for a packet carrying a real MAC2, which means one
-// issued under load. Forced here, because one in 256 is not a thing to leave to
-// chance in a test.
-func TestVersion1PacketNamingVersion2StillGetsThrough(t *testing.T) {
-	sc, cc := pair(t, EnvelopeV1, []uint8{EnvelopeV1, EnvelopeV2})
+// The header is read before it is authenticated. Tampering with it must cost a
+// drop and never an accept: both tags cover it as a prefix.
+func TestFlippedHeaderIsDropped(t *testing.T) {
+	sc, cc := pair(t, EnvelopeV4, []uint8{EnvelopeV4})
+
 	buf := cc.buildInitial(initialDatagram())
-	if buf[len(buf)-1] != 0 {
-		t.Fatalf("no cookie should mean a zero tail, got %#02x", buf[len(buf)-1])
-	}
-
-	// Now make it look like a version 2 marker. Not under load, so MAC2's
-	// contents are never examined and only the dispatch changes.
-	buf[len(buf)-1] = EnvelopeV2
-
-	ok, quicLen := sc.validateAndStrip(buf, len(buf), nil)
-	if !ok || quicLen != testDatagram {
-		t.Fatal("the version 1 fallback did not rescue a packet that named version 2")
-	}
-}
-
-// A deployment must be able to retire a version, or the oldest envelope ever
-// defined is a permanent floor.
-func TestServerCanRetireVersion1(t *testing.T) {
-	sc, cc := pair(t, EnvelopeV1, []uint8{EnvelopeV2})
-	buf := cc.buildInitial(initialDatagram())
+	buf[len(buf)-1] = Hdr(EnvelopeV4, true) // claim an identity that is not there
 	if ok, _ := sc.validateAndStrip(buf, len(buf), nil); ok {
-		t.Fatal("a server that retired version 1 still accepted it")
+		t.Fatal("a flipped identity flag was accepted")
 	}
-}
 
-// And a server that has not learned version 2 refuses it, which is the direction
-// that does not interoperate and the reason for servers-first deployment.
-func TestVersion1ServerRefusesVersion2(t *testing.T) {
-	sc, cc := pair(t, EnvelopeV2, []uint8{EnvelopeV1})
-	buf := cc.buildInitial(initialDatagram())
+	buf = cc.buildInitial(initialDatagram())
+	buf[len(buf)-1] = Hdr(7, false)
 	if ok, _ := sc.validateAndStrip(buf, len(buf), nil); ok {
-		t.Fatal("a version 1 server accepted a version 2 envelope")
+		t.Fatal("an unknown version was accepted")
 	}
 }
 
-// The marker is read before it is authenticated. Tampering with it must cost a
-// drop and never an accept: MAC1 covers it as a prefix, so a flipped marker is a
-// tag over a layout the sender never used.
-func TestFlippedMarkerIsDropped(t *testing.T) {
-	sc, cc := pair(t, EnvelopeV2, []uint8{EnvelopeV1, EnvelopeV2})
-	buf := cc.buildInitial(initialDatagram())
-	buf[len(buf)-1] = 7 // a version nobody defines
-	if ok, _ := sc.validateAndStrip(buf, len(buf), nil); ok {
-		t.Fatal("an unknown marker was accepted")
+// SIP-29's reason for prefixing the header: a tag computed under one header
+// must be unrelated to the same input under another.
+func TestBothTagsAreBoundToTheHeaderByte(t *testing.T) {
+	covered := []byte("a QUIC datagram, a client key, a timestamp")
+	anon := Hdr(EnvelopeV4, false)
+	ident := Hdr(EnvelopeV4, true)
+	shared := []byte("shared secret for tests..........")
+
+	m := ComputeMAC1(anon, shared, covered)
+	if VerifyMAC1(ident, shared, covered, m) {
+		t.Fatal("MAC1 ignored the header")
+	}
+
+	key := GateKey([]byte("a server public key.............."))
+	g := ComputeGate(anon, key[:], covered)
+	if VerifyGate(ident, key[:], covered, g) {
+		t.Fatal("the gate ignored the header")
 	}
 }
 
-// SIP-29 prefixes the version to the MAC1 input rather than appending it, so
-// that tags computed under different versions are unrelated even when everything
-// after the prefix is identical.
-func TestMAC1IsBoundToTheEnvelopeVersion(t *testing.T) {
-	secret := make([]byte, 32)
-	rand.Read(secret)
-	data := []byte("one QUIC Initial")
-	ed := make([]byte, Ed25519Size)
-	ts := NowTimestamp()
-	nonce, _ := GenerateNonce()
+// The property the gate exists for.
+func TestGateSeparatesACallerWhoKnowsTheKey(t *testing.T) {
+	covered := []byte("envelope bytes")
+	h := Hdr(EnvelopeV4, false)
+	mine := GateKey([]byte("the real server public key......."))
+	theirs := GateKey([]byte("some other server's public key.."))
 
-	v1 := ComputeMAC1(EnvelopeV1, secret, data, ed, ts, nonce)
-	v2 := ComputeMAC1(EnvelopeV2, secret, data, ed, ts, nonce)
-	if hmac.Equal(v1, v2) {
-		t.Fatal("the version is not in the MAC1 input")
+	tag := ComputeGate(h, mine[:], covered)
+	if !VerifyGate(h, mine[:], covered, tag) {
+		t.Fatal("a caller holding the key was refused")
 	}
-	if VerifyMAC1(EnvelopeV2, secret, data, ed, ts, nonce, v1) {
-		t.Fatal("a version 1 tag verified as version 2")
-	}
-	if VerifyMAC1(EnvelopeV1, secret, data, ed, ts, nonce, v2) {
-		t.Fatal("a version 2 tag verified as version 1")
-	}
-	if !VerifyMAC1(EnvelopeV1, secret, data, ed, ts, nonce, v1) ||
-		!VerifyMAC1(EnvelopeV2, secret, data, ed, ts, nonce, v2) {
-		t.Fatal("a tag did not verify under its own version")
+	if VerifyGate(h, theirs[:], covered, tag) {
+		t.Fatal("a stranger's tag verified")
 	}
 }
 
-// Version 1 predates the marker, so its MAC1 must be exactly what SIP-6
-// specified — no prefix. A peer that started prefixing version 1 would break
-// every deployment still on it.
-func TestVersion1MAC1CarriesNoPrefix(t *testing.T) {
-	secret := make([]byte, 32)
-	for i := range secret {
-		secret[i] = 0x11
-	}
-	data := []byte("payload")
-	ed := make([]byte, Ed25519Size)
-	var ts uint32 = 1234
-	nonce := make([]byte, NonceSize)
-	for i := range nonce {
-		nonce[i] = 7
-	}
+// The two modes must not verify each other, or the load rule could be
+// side-stepped by sending the cheaper form.
+func TestTheTwoGateModesDoNotVerifyEachOther(t *testing.T) {
+	covered := []byte("envelope bytes")
+	h := Hdr(EnvelopeV4, false)
+	key := GateKey([]byte("a server public key.............."))
+	cookie := []byte("0123456789abcdef")
 
-	mac := hmac.New(sha256.New, secret)
-	mac.Write(data)
-	mac.Write(ed)
-	var tsb [4]byte
-	binary.BigEndian.PutUint32(tsb[:], ts)
-	mac.Write(tsb[:])
-	mac.Write(nonce)
-	want := mac.Sum(nil)[:MACSize]
+	byKey := ComputeGate(h, key[:], covered)
+	byCookie := ComputeGate(h, cookie, covered)
 
-	got := ComputeMAC1(EnvelopeV1, secret, data, ed, ts, nonce)
-	if !hmac.Equal(got, want) {
-		t.Fatal("version 1 MAC1 is no longer SIP-6's construction")
+	if VerifyGate(h, cookie, covered, byKey) {
+		t.Fatal("a public-key tag verified as a cookie tag")
+	}
+	if VerifyGate(h, key[:], covered, byCookie) {
+		t.Fatal("a cookie tag verified as a public-key tag")
+	}
+}
+
+// Both keys are derived from the same public value and separated only by their
+// labels. Reusing one label would key two unrelated constructions identically.
+func TestGateAndCookieKeysAreSeparated(t *testing.T) {
+	pub := []byte("a server public key..............")
+	if GateKey(pub) == CookieKey(pub) {
+		t.Fatal("the gate key and the cookie key are the same")
 	}
 }
 
 func TestTrailerLenKnowsOnlyDefinedVersions(t *testing.T) {
-	if n, ok := TrailerLen(EnvelopeV1); !ok || n != MACOverhead {
-		t.Fatalf("version 1 trailer = %d, %v", n, ok)
+	if n, ok := TrailerLen(Hdr(EnvelopeV4, false)); !ok || n != TrailerAnon {
+		t.Fatalf("anonymous width is %d (ok=%v), want %d", n, ok, TrailerAnon)
 	}
-	if n, ok := TrailerLen(EnvelopeV2); !ok || n != MACOverhead+1 {
-		t.Fatalf("version 2 trailer = %d, %v", n, ok)
+	if n, ok := TrailerLen(Hdr(EnvelopeV4, true)); !ok || n != TrailerWithIdentity {
+		t.Fatalf("identity width is %d (ok=%v), want %d", n, ok, TrailerWithIdentity)
 	}
-	if n, ok := TrailerLen(EnvelopeV3); !ok || n != MACOverheadV2+MAC0Size {
-		t.Fatalf("version 3 trailer = %d, %v", n, ok)
-	}
-	// Version 0 is reserved and never emitted, so a zero byte is known not to
-	// be a marker.
-	for _, v := range []uint8{0, 4, 255} {
-		if _, ok := TrailerLen(v); ok {
-			t.Fatalf("version %d should be unknown", v)
+	for _, v := range []uint8{0, 1, 2, 3, 5, 15} {
+		if _, ok := TrailerLen(Hdr(v, false)); ok {
+			t.Fatalf("version %d was accepted", v)
 		}
 	}
 }
 
-// Only v3 carries MAC0, and that is what decides whether a caller can be turned
-// away before the cookie stage.
-func TestOnlyVersion3CarriesMAC0(t *testing.T) {
-	if HasMAC0(EnvelopeV1) || HasMAC0(EnvelopeV2) || !HasMAC0(EnvelopeV3) {
-		t.Fatal("HasMAC0 does not match the envelope versions")
-	}
-}
-
-// MAC0 is keyed on the server's public key, so a caller holding that key can
-// compute it and a caller without it cannot. That is the whole property: it
-// separates "knows the key" from "does not" for the price of one HMAC, with no
-// curve operation and no cookie exchange.
-func TestMAC0SeparatesACallerWhoKnowsTheKey(t *testing.T) {
-	serverPub := bytes.Repeat([]byte{0x5C}, 32)
-	key := MAC0Key(serverPub)
-	covered := []byte("a QUIC Initial and its envelope, up to MAC0")
-
-	tag := ComputeMAC0(EnvelopeV3, key, covered)
-	if !VerifyMAC0(EnvelopeV3, key, covered, tag) {
-		t.Fatal("a MAC0 we computed ourselves did not verify")
-	}
-	stranger := MAC0Key(bytes.Repeat([]byte{0x5D}, 32))
-	if VerifyMAC0(EnvelopeV3, stranger, covered, tag) {
-		t.Error("a stranger's key verified the tag")
-	}
-	tampered := append([]byte(nil), covered...)
-	tampered[0] ^= 0xFF
-	if VerifyMAC0(EnvelopeV3, key, tampered, tag) {
-		t.Error("tampering with a covered byte did not break the tag")
-	}
-}
-
-// The version is prefixed to MAC0's input for the reason SIP-29 gives for MAC1:
-// a receiver reads the marker before it can verify anything, so the marker has
-// to be inside what it verifies.
-func TestMAC0IsBoundToTheEnvelopeVersion(t *testing.T) {
-	key := MAC0Key(bytes.Repeat([]byte{7}, 32))
-	covered := []byte("same bytes, different version")
-	if VerifyMAC0(4, key, covered, ComputeMAC0(EnvelopeV3, key, covered)) {
-		t.Fatal("a v3 tag verified under version 4")
-	}
-}
-
-// MAC0 and the cookie-reply key are both derived from the server's public key
-// and must not collide — separate labels, separate keys.
-func TestMAC0AndCookieKeysAreSeparated(t *testing.T) {
-	pub := bytes.Repeat([]byte{0x11}, 32)
-	if MAC0Key(pub) == CookieKey(pub) {
-		t.Fatal("MAC0 and cookie keys collide")
-	}
-}
-
-// The list and the width table are two statements of the same fact, and a
-// version added to one and not the other is a silent hole: an envelope counted
-// but never parsed, or parsed but never counted.
 func TestEveryKnownVersionHasATrailer(t *testing.T) {
 	for _, v := range EnvelopeVersions {
-		if _, ok := TrailerLen(v); !ok {
-			t.Errorf("version %d has no trailer width", v)
+		if _, ok := TrailerLen(Hdr(v, false)); !ok {
+			t.Fatalf("version %d has no trailer width", v)
 		}
 		if _, ok := VersionIndex(v); !ok {
-			t.Errorf("version %d has no index", v)
-		}
-	}
-	for _, v := range []uint8{0, 200} {
-		if _, ok := VersionIndex(v); ok {
-			t.Errorf("version %d should be unknown", v)
+			t.Fatalf("version %d has no counter slot", v)
 		}
 	}
 }

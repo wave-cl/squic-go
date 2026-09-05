@@ -13,45 +13,45 @@ import (
 // shows up on the wire as a handshake that quietly takes an extra round trip
 // forever, or does not complete at all.
 
-func TestMACOverheadIs108(t *testing.T) {
-	if MACOverhead != 108 {
-		t.Fatalf("envelope is %d bytes; SIP-6 fixes it at 108", MACOverhead)
+func TestTrailerWidthsAre69And101(t *testing.T) {
+	if TrailerAnon != 69 {
+		t.Fatalf("anonymous trailer is %d bytes, want 69", TrailerAnon)
 	}
-	if MACOverhead != ClientKeySize+Ed25519Size+TimestampSize+NonceSize+MACSize+MAC2Size {
-		t.Fatal("MACOverhead does not equal the sum of its fields")
+	if TrailerAnon != ClientKeySize+TimestampSize+GateSize+MACSize+HdrSize {
+		t.Fatal("TrailerAnon does not equal the sum of its fields")
+	}
+	if TrailerWithIdentity != TrailerAnon+Ed25519Size {
+		t.Fatalf("identity trailer is %d bytes, want %d", TrailerWithIdentity, TrailerAnon+Ed25519Size)
 	}
 }
 
-// MAC2 covers the envelope up to but NOT including MAC1, with MAC1 fed in
-// separately. Covering the buffer whole folds MAC1 in twice and never verifies
-// — and because a failing MAC2 is indistinguishable from a client that has no
-// cookie, the symptom is not an error but an extra round trip, forever.
-func TestMAC2CoversTheEnvelopeUpToMAC1(t *testing.T) {
-	cookie := bytes.Repeat([]byte{0x7a}, 16)
-	shared := bytes.Repeat([]byte{0xab}, 32)
-	datagram := []byte("a QUIC Initial, more or less")
-	ed := make([]byte, Ed25519Size)
-	ts := NowTimestamp()
-	nonce, _ := GenerateNonce()
-	mac1 := ComputeMAC1(EnvelopeV1, shared, datagram, ed, ts, nonce)
+// Both tags cover the same contiguous range and differ only in key. That is
+// what lets one field carry two proofs, and it is the construction squic-rust
+// has to agree with byte for byte.
+func TestBothTagsCoverTheSameRange(t *testing.T) {
+	hdr := Hdr(EnvelopeV4, false)
+	covered := bytes.Repeat([]byte{0x5c}, 64)
+	key := GateKey(bytes.Repeat([]byte{0x11}, 32))
+	shared := bytes.Repeat([]byte{0x22}, 32)
 
-	var buf []byte
-	buf = append(buf, datagram...)
-	buf = append(buf, bytes.Repeat([]byte{0x11}, ClientKeySize)...)
-	buf = append(buf, ed...)
-	buf = append(buf, byte(ts>>24), byte(ts>>16), byte(ts>>8), byte(ts))
-	buf = append(buf, nonce...)
-	beforeMAC1 := len(buf)
-	buf = append(buf, mac1...)
+	gate := ComputeGate(hdr, key[:], covered)
+	mac1 := ComputeMAC1(hdr, shared, covered)
 
-	right := ComputeMAC2(cookie, buf[:beforeMAC1], mac1)
-	if !VerifyMAC2(cookie, buf[:beforeMAC1], mac1, right) {
-		t.Fatal("MAC2 over the specified range does not verify")
+	if !VerifyGate(hdr, key[:], covered, gate) {
+		t.Fatal("the gate did not verify over its own range")
 	}
-
-	wrong := ComputeMAC2(cookie, buf, mac1)
-	if VerifyMAC2(cookie, buf[:beforeMAC1], mac1, wrong) {
-		t.Fatal("MAC2 over the whole buffer verified against the specified range")
+	if !VerifyMAC1(hdr, shared, covered, mac1) {
+		t.Fatal("MAC1 did not verify over its own range")
+	}
+	// Same range, different keys, so the tags must differ.
+	if bytes.Equal(gate, mac1) {
+		t.Fatal("the gate and MAC1 produced the same tag")
+	}
+	// One byte of the range altered breaks both.
+	altered := append([]byte(nil), covered...)
+	altered[0] ^= 1
+	if VerifyGate(hdr, key[:], altered, gate) || VerifyMAC1(hdr, shared, altered, mac1) {
+		t.Fatal("a tag verified over a range it did not cover")
 	}
 }
 
@@ -109,7 +109,7 @@ func TestLoadMonitorRaisesAndClearsUnderLoad(t *testing.T) {
 
 	seed := make([]byte, 32)
 	rand.Read(seed)
-	sc := newServerConn(conn, seed, nil, 5, []uint8{EnvelopeV1, EnvelopeV2})
+	sc := newServerConn(conn, seed, nil, 5, []uint8{EnvelopeV4})
 
 	if sc.underLoad.Load() {
 		t.Fatal("a server starts under load")
@@ -141,7 +141,7 @@ func TestCookieRotationKeepsOneGenerationOfGrace(t *testing.T) {
 
 	seed := make([]byte, 32)
 	rand.Read(seed)
-	sc := newServerConn(conn, seed, nil, 0, []uint8{EnvelopeV1, EnvelopeV2}) // defence off: no background rotation
+	sc := newServerConn(conn, seed, nil, 0, []uint8{EnvelopeV4}) // defence off: no background rotation
 
 	ip := net.ParseIP("198.51.100.9")
 	current, _ := sc.cookieSecrets()

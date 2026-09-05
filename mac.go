@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/binary"
 	"net"
 	"time"
 
@@ -17,60 +16,49 @@ const (
 	// MACSize is the size of the MAC1 tag in bytes.
 	MACSize = 16
 
+	// GateSize is the size of the gate tag in bytes.
+	GateSize = 16
+
+	// CookieSize is the size of the cookie a challenge carries.
+	CookieSize = 16
+
 	// ClientKeySize is the size of an X25519 public key appended to Initial packets.
 	ClientKeySize = 32
 
-	// Ed25519Size is the size of the carried Ed25519 identity field (SIP-3).
-	// All-zero means "no identity asserted".
+	// Ed25519Size is the size of the carried Ed25519 identity field (SIP-3),
+	// when one is present.
 	Ed25519Size = 32
 
 	// TimestampSize is the size of the replay-protection timestamp (uint32 epoch seconds).
 	TimestampSize = 4
 
-	// NonceSize is the size of the random nonce in bytes.
-	NonceSize = 8
+	// HdrSize is the width of the trailing header byte: version in the high
+	// nibble, flags in the low one.
+	HdrSize = 1
 
-	// MAC2Size is the size of the MAC2 tag in bytes.
-	MAC2Size = 16
-
-	// MACOverhead is the total overhead appended to Initial packets by envelope
-	// version 1 (SIP-6): 32-byte client X25519 public key + 32-byte Ed25519
-	// identity + 4-byte timestamp + 8-byte nonce + 16-byte MAC1 + 16-byte MAC2.
-	MACOverhead = ClientKeySize + Ed25519Size + TimestampSize + NonceSize + MACSize + MAC2Size
-
-	// EnvelopeV1 is the envelope of SIP-6: no marker byte on the wire. It is
-	// named so that a receiver supporting both has something to call the
-	// unmarked form.
-	EnvelopeV1 = 1
-
-	// EnvelopeV2 is EnvelopeV1 plus a one-byte version marker, last (SIP-29).
-	EnvelopeV2 = 2
-
-	// EnvelopeV3 is EnvelopeV2 plus MAC0, a cheap outer MAC keyed on the
-	// server's public key and verified before any curve operation.
+	// EnvelopeV4 replaces the separate MAC0 and MAC2 of version 3 with one gate
+	// tag.
 	//
-	// MAC1 is a Diffie-Hellman, so a server cannot tell a caller who knows its
-	// public key from a stranger without paying for one — which is why the
-	// cookie defence has to challenge before it knows who it is talking to, and
-	// why a server under load answers everybody. WireGuard does not have this
-	// problem: its MAC1 is keyed on a *hash* of the responder's static public
-	// key and costs a hash to check, so it only ever cookies callers that have
-	// already proved they know the key. MAC0 is that construction, added
-	// alongside sQUIC's MAC1 rather than replacing it.
-	EnvelopeV3 = 3
+	// They were never both load-bearing: a cookie is delivered encrypted under
+	// a key derived from the server's public key, so producing a valid MAC2
+	// already demonstrated the key knowledge MAC0 existed to prove. Version 3
+	// paid 32 bytes for two states of one proof.
+	//
+	// The identity field is now carried only when there is one, and the
+	// version-1 nonce is gone — SIP-6 said it was never tracked, and the QUIC
+	// datagram underneath already differs per attempt.
+	EnvelopeV4 = 4
 
-	// MAC0Size is the size of the MAC0 tag in bytes.
-	MAC0Size = 16
+	// FlagIdentity marks that a 32-byte Ed25519 identity follows the X25519
+	// key (SIP-3).
+	FlagIdentity = 0x01
 
-	// VersionSize is the width of the version marker.
-	VersionSize = 1
+	// TrailerAnon is the trailer width for an anonymous caller: X25519,
+	// timestamp, gate, MAC1, header.
+	TrailerAnon = ClientKeySize + TimestampSize + GateSize + MACSize + HdrSize
 
-	// MACOverheadV2 is the trailer width for envelope version 2.
-	MACOverheadV2 = MACOverhead + VersionSize
-
-	// MACOverheadV3 is the trailer width for envelope version 3: version 2 plus
-	// the MAC0 field.
-	MACOverheadV3 = MACOverheadV2 + MAC0Size
+	// TrailerWithIdentity is the trailer width when an identity is carried.
+	TrailerWithIdentity = TrailerAnon + Ed25519Size
 
 	// CookieReplyType is the first byte of a cookie reply packet.
 	// Distinguishes from QUIC packets (Initial starts with 0xC0+).
@@ -84,30 +72,47 @@ const (
 	ReplayWindow = 120 * time.Second
 )
 
-// TrailerLen returns the trailer width for an envelope version, and false if
-// the version is unknown.
-//
-// SIP-29: version 0 is reserved and never emitted, so a zero byte is known not
-// to be a marker.
-func TrailerLen(version uint8) (int, bool) {
-	switch version {
-	case EnvelopeV1:
-		return MACOverhead, true
-	case EnvelopeV2:
-		return MACOverheadV2, true
-	case EnvelopeV3:
-		return MACOverheadV3, true
-	default:
-		return 0, false
+// Hdr builds the trailing header byte.
+func Hdr(version uint8, identity bool) uint8 {
+	h := version << 4
+	if identity {
+		h |= FlagIdentity
 	}
+	return h
 }
 
-// EnvelopeVersions is every envelope version this build knows, lowest first.
+// HdrVersion returns the version half of a header byte.
+func HdrVersion(hdr uint8) uint8 {
+	return hdr >> 4
+}
+
+// HdrHasIdentity reports whether a header byte says an Ed25519 identity is
+// carried.
+func HdrHasIdentity(hdr uint8) bool {
+	return hdr&FlagIdentity != 0
+}
+
+// TrailerLen returns the trailer width a header byte implies, and false if the
+// version is unknown.
+//
+// Unlike version 3 this is not a constant per version: the identity field is
+// present only when flagged, so the width has to be read off the header byte
+// that a receiver finds at the end of the datagram.
+func TrailerLen(hdr uint8) (int, bool) {
+	if HdrVersion(hdr) != EnvelopeV4 {
+		return 0, false
+	}
+	if HdrHasIdentity(hdr) {
+		return TrailerWithIdentity, true
+	}
+	return TrailerAnon, true
+}
+
+// EnvelopeVersions is every envelope version this build knows.
 //
 // The one list to extend when a version is added — TrailerLen and the
-// per-version accept counters are both keyed off it, and
-// TestEveryKnownVersionHasATrailer fails if the two drift apart.
-var EnvelopeVersions = []uint8{EnvelopeV1, EnvelopeV2, EnvelopeV3}
+// per-version accept counters are both keyed off it.
+var EnvelopeVersions = []uint8{EnvelopeV4}
 
 // VersionIndex returns the position of version in EnvelopeVersions, for
 // indexing per-version state, and false for a version this build does not know.
@@ -120,119 +125,85 @@ func VersionIndex(version uint8) (int, bool) {
 	return 0, false
 }
 
-// HasMAC0 reports whether an envelope version carries a MAC0 field.
-func HasMAC0(version uint8) bool {
-	return version >= EnvelopeV3
-}
+// gateKeyLabel is the domain separator for the gate key.
+var gateKeyLabel = []byte("squic-gate-v1")
 
-// mac0KeyLabel is the domain separator for the MAC0 key.
-var mac0KeyLabel = []byte("squic-mac0-v1")
-
-// MAC0Key derives the MAC0 key from the server's X25519 public key.
+// GateKey derives the no-cookie gate key from the server's X25519 public key.
 //
 // Keyed on a *public* value, deliberately. Every legitimate caller already
 // holds the server's public key — that is the premise of a silent server — so
-// both ends can compute this with one hash and no key agreement. It is
-// therefore not authentication: anyone holding the key can forge a MAC0, and
-// MAC1 remains the proof of possession. What it buys is that a caller who does
-// not hold the key can be turned away for the price of one HMAC, before the
-// cookie decision and before the Diffie-Hellman.
-func MAC0Key(serverX25519Pub []byte) [32]byte {
+// both ends compute this with one hash and no key agreement. It is therefore
+// not authentication: anyone holding the key can forge this tag, and MAC1
+// remains the proof of possession. What it buys is that a caller who does
+// *not* hold the key is turned away for the price of one HMAC, before the
+// Diffie-Hellman.
+func GateKey(serverX25519Pub []byte) [32]byte {
 	h := sha256.New()
-	h.Write(mac0KeyLabel)
+	h.Write(gateKeyLabel)
 	h.Write(serverX25519Pub)
 	var key [32]byte
 	copy(key[:], h.Sum(nil))
 	return key
 }
 
-// ComputeMAC0 computes MAC0 over the envelope up to but not including MAC0.
+// ComputeGate computes the gate tag over the envelope up to but not including
+// the tag.
 //
-// covered is datagram || x25519 || ed25519 || ts || nonce — one contiguous
-// slice, which is why this takes bytes rather than fields. The version is
-// prefixed for the reason SIP-29 gives for MAC1: it authenticates the marker a
-// receiver has to read before it can verify anything, and it makes tags
-// computed under different versions unrelated.
+// covered is datagram || x25519 || [ed25519] || ts — one contiguous slice,
+// which is why this takes bytes rather than fields. The header byte is
+// prefixed for the reason SIP-29 gives: it authenticates the byte a receiver
+// has to read before it can verify anything, and because it comes first, tags
+// computed under different versions or flags are unrelated even when the rest
+// of the input coincides.
 //
-// Unlike MAC1 this covers the client's X25519 key explicitly. MAC1 does not
-// need to — that key is what its shared secret is derived from — but MAC0's key
-// does not depend on it, so leaving it out would let it be swapped.
-func ComputeMAC0(version uint8, key [32]byte, covered []byte) []byte {
-	mac := hmac.New(sha256.New, key[:])
-	mac.Write([]byte{version})
+// The key is what makes this one field do two jobs:
+//
+//   - GateKey — the caller holds no cookie, and the tag proves only that it
+//     knows the server's public key.
+//   - the cookie itself — the caller answered a challenge, and the tag proves
+//     that and that its source address receives packets, which no single
+//     datagram can demonstrate on its own.
+func ComputeGate(hdr uint8, key []byte, covered []byte) []byte {
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte{hdr})
 	mac.Write(covered)
-	return mac.Sum(nil)[:MAC0Size]
+	return mac.Sum(nil)[:GateSize]
 }
 
-// VerifyMAC0 checks a MAC0 tag in constant time.
-func VerifyMAC0(version uint8, key [32]byte, covered []byte, mac0 []byte) bool {
-	return subtle.ConstantTimeCompare(mac0, ComputeMAC0(version, key, covered)) == 1
+// VerifyGate checks a gate tag in constant time.
+func VerifyGate(hdr uint8, key []byte, covered []byte, gate []byte) bool {
+	return subtle.ConstantTimeCompare(gate, ComputeGate(hdr, key, covered)) == 1
 }
 
-// ComputeMAC1 computes a MAC1 tag with a timestamp and nonce for replay protection.
-// MAC1 = HMAC-SHA256(sharedSecret, [version ||] data || ed25519 || timestamp || nonce)[:16]
+// ComputeMAC1 computes MAC1 over the same range the gate tag covers, keyed on
+// the Diffie-Hellman shared secret.
 //
-// SIP-3: the carried Ed25519 identity field is part of the MAC1 input (it does
-// not feed the shared secret, so leaving it unauthenticated would let an on-path
-// attacker substitute the sign-conjugate key and flip the reported identity).
-// ed25519 is the 32-byte field exactly as it appears on the wire (all zeros when
-// no identity is asserted).
+// One covered range for both tags — hdr || datagram || x25519 || [ed25519] ||
+// ts — so there is a single rule to hold rather than two constructions with
+// different opinions about what they authenticate.
 //
-// SIP-29: every marked version prefixes its version byte; version 1 predates the
-// marker and prefixes nothing. A prefix rather than a suffix, because it is doing
-// two jobs. It authenticates the marker, which a receiver has to read before it
-// can verify anything. And because it comes first, tags computed under different
-// versions are unrelated even when the remaining input coincides — so a packet
-// valid under one version can never verify under another, whatever an attacker
-// picks for the rest of the envelope.
-func ComputeMAC1(version uint8, sharedSecret []byte, data []byte, ed25519 []byte, timestamp uint32, nonce []byte) []byte {
+// This is the proof of possession, and the reason it cannot merge with the
+// gate: verifying it requires the curve operation the gate exists to avoid.
+//
+// SIP-3: the carried Ed25519 identity is inside the covered range. That is
+// load-bearing — it does not feed the shared secret, so if it were left
+// unauthenticated an on-path attacker could substitute the sign-conjugate key,
+// which passes the server's derivation check, and flip the reported identity.
+func ComputeMAC1(hdr uint8, sharedSecret []byte, covered []byte) []byte {
 	mac := hmac.New(sha256.New, sharedSecret)
-	if version != EnvelopeV1 {
-		mac.Write([]byte{version})
-	}
-	mac.Write(data)
-	mac.Write(ed25519)
-	var ts [4]byte
-	binary.BigEndian.PutUint32(ts[:], timestamp)
-	mac.Write(ts[:])
-	mac.Write(nonce)
+	mac.Write([]byte{hdr})
+	mac.Write(covered)
 	return mac.Sum(nil)[:MACSize]
 }
 
-// VerifyMAC1 checks a MAC1 tag against data, the ed25519 field, timestamp,
-// nonce, and shared secret.
-func VerifyMAC1(version uint8, sharedSecret []byte, data []byte, ed25519 []byte, timestamp uint32, nonce []byte, mac1 []byte) bool {
-	expected := ComputeMAC1(version, sharedSecret, data, ed25519, timestamp, nonce)
-	return subtle.ConstantTimeCompare(mac1, expected) == 1
-}
-
-// GenerateNonce generates a cryptographically random 8-byte nonce.
-func GenerateNonce() ([]byte, error) {
-	nonce := make([]byte, NonceSize)
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
-	}
-	return nonce, nil
+// VerifyMAC1 checks a MAC1 tag in constant time.
+func VerifyMAC1(hdr uint8, sharedSecret []byte, covered []byte, mac1 []byte) bool {
+	return subtle.ConstantTimeCompare(mac1, ComputeMAC1(hdr, sharedSecret, covered)) == 1
 }
 
 // NowTimestamp returns the current time as a uint32 epoch seconds value.
 func NowTimestamp() uint32 {
 	return uint32(time.Now().Unix())
-}
-
-// ComputeMAC2 computes a MAC2 tag from a cookie and the packet+MAC1 data.
-// MAC2 = HMAC-SHA256(cookie, packet || mac1)[:16]
-func ComputeMAC2(cookie []byte, packet []byte, mac1 []byte) []byte {
-	mac := hmac.New(sha256.New, cookie)
-	mac.Write(packet)
-	mac.Write(mac1)
-	return mac.Sum(nil)[:MAC2Size]
-}
-
-// VerifyMAC2 checks a MAC2 tag.
-func VerifyMAC2(cookie []byte, packet []byte, mac1 []byte, mac2 []byte) bool {
-	expected := ComputeMAC2(cookie, packet, mac1)
-	return subtle.ConstantTimeCompare(mac2, expected) == 1
 }
 
 // CookieValue computes a deterministic cookie for a given (secret, IP) pair.
