@@ -275,10 +275,10 @@ type clientConn struct {
 	advertiseEd25519 []byte           // SIP-3: 32-byte Ed25519 identity to assert, or 32 zero bytes
 	envelopeVersion  uint8            // SIP-29: the envelope version this client emits
 	serverAddr       *net.UDPAddr     // the address dialled; a cookie reply from anywhere else is not ours
-	gateKey          [32]byte         // keys MAC0 (envelope v3); derived from the server's public key
+	gateKey          [32]byte         // keys the gate tag without a cookie; from the server's public key
 	cookieKey        [32]byte         // decrypts cookie replies; derived from the server's public key
 	handshakeDone    atomic.Bool      // true after first non-cookie packet; skips the cookie scan
-	cookie           atomic.Value     // decrypted 16-byte cookie from the server, keys MAC2
+	cookie           atomic.Value     // decrypted 16-byte cookie from the server; keys the gate tag
 	// The most recent Initial datagram and where it went, so a cookie
 	// challenge can be answered immediately rather than at the next PTO.
 	lastInitial atomic.Value // holds sentInitial
@@ -315,8 +315,8 @@ func newClientConn(conn *net.UDPConn, sharedSecret, clientX25519Pub, advertiseEd
 
 // storeCookie opens a cookie reply and keeps the cookie for the next Initial.
 //
-// The reply arrives encrypted; MAC2 is keyed on the plaintext, so it has to be
-// opened here. A reply we cannot open did not come from a server holding the
+// The reply arrives encrypted; the gate tag is keyed on the plaintext cookie,
+// so it has to be opened here. A reply we cannot open did not come from a server holding the
 // key we expect, so it is dropped and any cookie we already had is kept.
 func (c *clientConn) storeCookie(payload []byte) bool {
 	plain, ok := DecryptCookie(c.cookieKey, payload)
@@ -356,15 +356,16 @@ func (c *clientConn) fromServer(a net.Addr) bool {
 	return ua.Port == c.serverAddr.Port && ua.IP.Equal(c.serverAddr.IP)
 }
 
-// answerChallenge re-sends the last Initial straight away, now carrying MAC2.
+// answerChallenge re-sends the last Initial straight away, its gate tag now
+// keyed on the cookie instead of the server's public key.
 //
 // quic-go never sees a cookie reply — the read paths strip them out — so left
 // to itself it would not retransmit until its next PTO. The challenge is
 // answerable at once and waiting costs the caller a whole round of backoff, so
 // answer it here. WireGuard does the same, and squic-rust matches.
 //
-// Replaying the datagram is sound: the server dropped the original at the MAC2
-// gate before quic-go saw it, so this is the first time that packet number
+// Replaying the datagram is sound: the server dropped the original at the gate
+// before quic-go saw it, so this is the first time that packet number
 // reaches the peer; where it did get through, the duplicate is discarded. Only
 // the sQUIC envelope is rebuilt, never the QUIC packet inside it.
 func (c *clientConn) answerChallenge() {
@@ -576,7 +577,8 @@ func (c *clientConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	}
 }
 
-// buildInitial constructs the Initial packet with MAC1 + MAC2 appended.
+// buildInitial constructs the Initial packet with the envelope appended: the
+// gate tag and MAC1, and an identity only when there is one to carry.
 func (c *clientConn) buildInitial(p []byte) []byte {
 	// An identity is carried only when there is one to carry. The header byte
 	// says which, so the server knows the trailer's width before it parses

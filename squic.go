@@ -32,6 +32,32 @@ import (
 )
 
 // Config holds optional sQUIC configuration.
+//
+// # Parity with squic-rust
+//
+// The two implementations share a wire format, not a config surface, and the
+// gaps below are not oversights — they are places where quic-go and quinn
+// disagree about what is tunable. Recorded here because a caller who reads one
+// API and assumes the other is wrong without being told.
+//
+// No Go equivalent, and none can be added: squic-rust has send_window,
+// initial_rtt, congestion_controller and disable_active_migration. quic-go's
+// Config has no field for any of them, so a mirrored field here could only be
+// accepted and discarded — which is worse than its absence, because a setting
+// that is read and never applied looks like it works.
+//
+// No Rust equivalent: QuicConfig, below, replaces everything else wholesale.
+// quinn's TransportConfig is built inside squic-rust rather than accepted from
+// the caller, so it has no such hatch.
+//
+// Same concept, same meaning, different defaults: StreamReceiveWindow and
+// ReceiveWindow pair with squic-rust's stream_receive_window and
+// receive_window. They did not always — these were MaxStreamReceiveWindow and
+// MaxConnectionReceiveWindow and set only quic-go's auto-tuning ceiling, so one
+// name meant a fixed window there and a cap here. Setting either now pins the
+// window in both. What still differs is the value you get by leaving them
+// unset: quinn does not auto-tune, so squic-rust is fixed at 1 MB and 10 MB,
+// while quic-go starts there and tunes up to 6 MB and 15 MB.
 type Config struct {
 	// MaxIdleTimeout is the maximum time a connection can be idle.
 	// Default: 30 seconds.
@@ -59,13 +85,29 @@ type Config struct {
 	// Default: 10 seconds.
 	HandshakeTimeout time.Duration
 
-	// MaxStreamReceiveWindow is the maximum per-stream flow control window.
-	// Default: 6 MB.
-	MaxStreamReceiveWindow uint64
+	// StreamReceiveWindow is the per-stream flow control window, in bytes.
+	// Zero means unset. Default when unset: 1 MB initially, auto-tuned by
+	// quic-go up to 6 MB.
+	//
+	// Named and behaved to match squic-rust's stream_receive_window, which was
+	// not true before: this was MaxStreamReceiveWindow and set only quic-go's
+	// ceiling, so the same name meant a fixed window in one library and a cap
+	// on auto-tuning in the other. Setting it now pins the window — quic-go's
+	// initial and maximum are both set to this value — which is what quinn
+	// does, because quinn does not auto-tune at all.
+	//
+	// To cap auto-tuning rather than pin the window, which quic-go can do and
+	// quinn cannot, use QuicConfig. That asymmetry is the reason the escape
+	// hatch exists.
+	StreamReceiveWindow uint64
 
-	// MaxConnectionReceiveWindow is the maximum connection-level flow control window.
-	// Default: 15 MB.
-	MaxConnectionReceiveWindow uint64
+	// ReceiveWindow is the connection-level flow control window, in bytes.
+	// Zero means unset. Default when unset: 10 MB initially, auto-tuned by
+	// quic-go up to 15 MB.
+	//
+	// Matches squic-rust's receive_window, and pins the window for the reason
+	// given on StreamReceiveWindow.
+	ReceiveWindow uint64
 
 	// InitialMTU sets the initial UDP payload size. Range: 1200-65000.
 	// Default: 1200.
@@ -103,37 +145,32 @@ type Config struct {
 
 	// EnvelopeVersion is the envelope version this client emits (SIP-29).
 	//
-	// Zero means unset and selects EnvelopeV3 as of v0.65.0. It selected
-	// EnvelopeV2 in v0.64.0, which introduced version 3 — the discipline
-	// SIP-29 requires is that a release introducing a version ships clients
-	// still sending the previous one, so upgrading a client before a server
-	// cannot break anything, and a later release moves the default once
-	// servers have deployed. This is that later release.
+	// Zero means unset and selects EnvelopeV4, the only version implemented.
+	// Zero is safe as a sentinel because SIP-29 reserves version 0 and forbids
+	// emitting it, so it can never be a version somebody meant.
 	//
-	// Version 3 is what carries MAC0 (SIP-37), so this is also the release
-	// that lets a deployment retire versions 1 and 2 and get a server that
-	// stays silent under load.
+	// Versions 1 to 3 were removed rather than deprecated. A version that has
+	// to be narrowed *to* in order to be safe will be left wide somewhere, and
+	// versions 1 and 2 carried no cheap gate at all, so a default admitting
+	// them handed every stranger a curve operation. Dial refuses a version this
+	// build cannot emit rather than letting it become a handshake timeout.
 	//
-	// Set it to EnvelopeV2 if you still talk to a server older than squic-go
-	// v0.64.0, or EnvelopeV1 for one older than v0.62.0. Either drops a
-	// version 3 Initial in silence, so the symptom of aiming too high is a
-	// handshake timeout with no diagnostic.
-	//
-	// Zero is safe as a sentinel here because SIP-29 reserves version 0 and
-	// forbids emitting it, so it can never be a version somebody meant.
+	// Kept as a setting because the next transition will need it, not because
+	// there is anything to choose today.
 	EnvelopeVersion uint8
 
 	// AcceptedEnvelopeVersions is the set of envelope versions this server
-	// parses (SIP-29). Nil selects all of them, so a server can be upgraded
-	// without waiting for its clients. Drop older versions to retire them —
-	// which a deployment must be able to do, or the oldest envelope ever
-	// defined becomes a permanent floor.
+	// parses (SIP-29). Nil or empty selects EnvelopeV4, the only version
+	// implemented.
 	//
-	// Retiring v1 and v2 is what finishes the job v3 starts. Only v3 carries
-	// MAC0, so only a v3 caller can be turned away before the cookie stage; a
-	// server still accepting v1 or v2 will keep answering callers on those
-	// versions with a cookie while it is under load, whatever they know. Set
-	// this to []uint8{EnvelopeV3} once the clients have moved.
+	// Listen refuses to bind on a set naming any version this build cannot
+	// parse. That is not pedantry: such a server binds, reports itself healthy,
+	// and then drops every Initial in silence, because SIP-6 requires silence
+	// toward anything that fails validation. The operator sees a live process
+	// and a dead port. ex ran [3] right up to the v4 cut.
+	//
+	// The mechanism survives for the next transition; what does not survive is
+	// a default that admits a weaker version than the one the client sends.
 	AcceptedEnvelopeVersions []uint8
 
 	// QuicConfig allows passing additional quic-go configuration.
@@ -172,11 +209,17 @@ func (c *Config) quicConfig() *quic.Config {
 		if c.HandshakeTimeout > 0 {
 			qc.HandshakeIdleTimeout = c.HandshakeTimeout
 		}
-		if c.MaxStreamReceiveWindow > 0 {
-			qc.MaxStreamReceiveWindow = c.MaxStreamReceiveWindow
+		// Initial and maximum together, so the window is pinned rather than
+		// merely capped. quinn has no auto-tuning, so a caller who sets this
+		// field in squic-rust gets a fixed window; setting only the ceiling
+		// here would have given them a different thing under the same name.
+		if c.StreamReceiveWindow > 0 {
+			qc.InitialStreamReceiveWindow = c.StreamReceiveWindow
+			qc.MaxStreamReceiveWindow = c.StreamReceiveWindow
 		}
-		if c.MaxConnectionReceiveWindow > 0 {
-			qc.MaxConnectionReceiveWindow = c.MaxConnectionReceiveWindow
+		if c.ReceiveWindow > 0 {
+			qc.InitialConnectionReceiveWindow = c.ReceiveWindow
+			qc.MaxConnectionReceiveWindow = c.ReceiveWindow
 		}
 		if c.InitialMTU > 0 {
 			qc.InitialPacketSize = c.InitialMTU
@@ -251,8 +294,9 @@ type peerKeyHolder struct {
 // ServerListener wraps a quic.Listener with silent-server support.
 type ServerListener struct {
 	*quic.Listener
-	conn net.PacketConn
-	sc   *serverConn
+	conn      net.PacketConn
+	sc        *serverConn
+	publicKey []byte
 }
 
 // Listen creates a sQUIC listener on the given address.
@@ -366,7 +410,28 @@ func Listen(network, addr string, serverCert tls.Certificate, serverPubKey []byt
 		return nil, fmt.Errorf("squic: quic listen: %w", err)
 	}
 
-	return &ServerListener{Listener: ln, conn: rawConn, sc: wrappedConn}, nil
+	return &ServerListener{
+		Listener:  ln,
+		conn:      rawConn,
+		sc:        wrappedConn,
+		publicKey: append([]byte(nil), serverPubKey...),
+	}, nil
+}
+
+// PublicKey returns this server's Ed25519 public key — the one clients pin when
+// they dial, and the one passed to Listen.
+//
+// Without it a caller has to carry the key alongside the listener, which is the
+// arrangement squic-rust added ServerListener::public_key to end; this is the
+// Go half of that. The slice is a fresh copy, so a caller cannot reach back
+// through it and change what the listener reports.
+//
+// Note this is the *server's own* key, not the caller's. sQUIC verifies the
+// peer's X25519 key while validating the Initial (see PeerKey), and it could
+// not be reported as Ed25519 in any case — the map from Ed25519 to X25519 does
+// not run backwards.
+func (l *ServerListener) PublicKey() []byte {
+	return append([]byte(nil), l.publicKey...)
 }
 
 // PeerKey returns the peer's X25519 public key for an accepted connection, as

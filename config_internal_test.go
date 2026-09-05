@@ -405,3 +405,41 @@ func TestListenRejectsAnAcceptSetItCannotParse(t *testing.T) {
 	}
 	ln.Close()
 }
+
+// T3: the window fields mean the same thing in both implementations now, and
+// "the same thing" is a pinned window rather than a ceiling.
+//
+// quinn does not auto-tune, so a caller who sets stream_receive_window in
+// squic-rust gets a fixed window. Setting only quic-go's Max would have given
+// them a floor of 1 MB rising to whatever they asked for — a different thing
+// under the same name, which is what the audit found. Initial and Max are set
+// together so the two libraries do what each other do.
+func TestReceiveWindowsArePinnedNotCapped(t *testing.T) {
+	const stream = 3 << 20
+	const conn = 24 << 20
+
+	qc := (&Config{StreamReceiveWindow: stream, ReceiveWindow: conn}).quicConfig()
+
+	if qc.InitialStreamReceiveWindow != stream || qc.MaxStreamReceiveWindow != stream {
+		t.Errorf("stream window not pinned: initial=%d max=%d, want both %d",
+			qc.InitialStreamReceiveWindow, qc.MaxStreamReceiveWindow, stream)
+	}
+	if qc.InitialConnectionReceiveWindow != conn || qc.MaxConnectionReceiveWindow != conn {
+		t.Errorf("connection window not pinned: initial=%d max=%d, want both %d",
+			qc.InitialConnectionReceiveWindow, qc.MaxConnectionReceiveWindow, conn)
+	}
+
+	// Unset leaves quic-go's own auto-tuning in place, starting at the values
+	// squic-rust uses as its fixed defaults. The documented divergence.
+	def := (&Config{}).quicConfig()
+	if def.InitialStreamReceiveWindow != 1<<20 {
+		t.Errorf("default initial stream window = %d, want 1 MB", def.InitialStreamReceiveWindow)
+	}
+	if def.InitialConnectionReceiveWindow != 10<<20 {
+		t.Errorf("default initial connection window = %d, want 10 MB", def.InitialConnectionReceiveWindow)
+	}
+	if def.MaxStreamReceiveWindow != 0 {
+		t.Errorf("default pinned the stream ceiling at %d; auto-tuning should be quic-go's",
+			def.MaxStreamReceiveWindow)
+	}
+}

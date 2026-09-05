@@ -208,7 +208,8 @@ func NowTimestamp() uint32 {
 
 // CookieValue computes a deterministic cookie for a given (secret, IP) pair.
 // cookie = HMAC-SHA256(secret, ip)[:16]
-// This is deterministic so the server can recompute it to verify MAC2.
+// This is deterministic so the server can recompute it to verify a cookie-keyed
+// gate tag.
 func CookieValue(secret [32]byte, clientIP net.IP) []byte {
 	ip := clientIP.To16()
 	if ip == nil {

@@ -1108,3 +1108,49 @@ func TestIdentityMapAcceptsRealKey(t *testing.T) {
 		t.Error("strict and permissive maps disagree on a real key")
 	}
 }
+
+// T4: the listener can report its own public key, so a caller need not carry it
+// alongside — the arrangement squic-rust's ServerListener::public_key ended.
+//
+// The assertion that matters is not that some 32 bytes come back but that they
+// are the ones a client must pin: the test dials with them and completes a
+// handshake. A getter returning the wrong key would pass a length check and
+// fail here.
+func TestServerListenerReportsItsPublicKey(t *testing.T) {
+	cert, pubKey, err := squic.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := squic.Listen("udp", "127.0.0.1:0", cert, pubKey, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	got := ln.PublicKey()
+	if !bytes.Equal(got, pubKey) {
+		t.Fatalf("PublicKey() = %x, want %x", got, pubKey)
+	}
+
+	// A fresh copy each call: mutating what we got back must not change what
+	// the listener reports next time.
+	got[0] ^= 0xFF
+	if again := ln.PublicKey(); !bytes.Equal(again, pubKey) {
+		t.Errorf("PublicKey() returns the listener's own slice; caller mutation changed it to %x", again)
+	}
+
+	go func() {
+		c, err := ln.Accept(context.Background())
+		if err == nil {
+			c.CloseWithError(0, "")
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := squic.Dial(ctx, ln.Addr().String(), ln.PublicKey(), nil)
+	if err != nil {
+		t.Fatalf("the reported key did not work as the pinned server key: %v", err)
+	}
+	conn.CloseWithError(0, "")
+}
