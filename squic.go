@@ -173,6 +173,46 @@ type Config struct {
 	// a default that admits a weaker version than the one the client sends.
 	AcceptedEnvelopeVersions []uint8
 
+	// LocalBind is the local address Dial binds, instead of an ephemeral port.
+	//
+	// Pairs with squic-rust's local_bind, which is a SocketAddr where this is a
+	// string: each side takes what its own Dial and Listen already take, so a
+	// caller passes what it would have passed anyway.
+	//
+	// **This exists for hole punching and for nothing else** (SIP-25). A NAT
+	// maps an internal ip:port to an external one, and a peer can only be
+	// reached through the mapping the exchange observed — which means dialling
+	// *from* the port that made it. Dial otherwise binds :0 and gets a fresh
+	// port, and therefore a fresh mapping the peer has never seen.
+	//
+	// Empty — the default, and what every ordinary caller wants — binds an
+	// ephemeral port. Pinning one costs the ability to have two dials in flight
+	// at once, and gains nothing unless something else is holding the mapping
+	// open.
+	//
+	// Ignored by Listen, which already takes the address it binds.
+	LocalBind string
+
+	// Punch names addresses to send a punch datagram to, right after binding.
+	//
+	// A NAT will not deliver an inbound packet until something has gone out to
+	// that peer, so both sides send first and each one's outbound opens its own
+	// mapping. The datagram is one byte and is meant to be **dropped**: a
+	// short-header packet for a connection nobody has, which every squic
+	// endpoint discards in silence and never answers — a stateless reset here
+	// would be a reply to a caller that has proved nothing.
+	//
+	// **This is a send primitive with a caller-supplied destination**, which is
+	// the shape a reflection abuse takes, so it is bounded: at most
+	// MaxPunchTargets addresses, PunchDatagrams one-byte datagrams each. It
+	// amplifies nothing — one byte out per byte asked for — and the caller is
+	// the local application, which could send these itself.
+	//
+	// SIP-25 requires that an address reach a peer only after *both* sides
+	// asked an exchange to be introduced. Nothing here can enforce that; the
+	// transport takes an address and sends to it.
+	Punch []string
+
 	// QuicConfig allows passing additional quic-go configuration.
 	// If nil, sensible defaults are used. Overrides all other fields.
 	QuicConfig *quic.Config
@@ -346,6 +386,9 @@ func Listen(network, addr string, serverCert tls.Certificate, serverPubKey []byt
 	if err != nil {
 		return nil, fmt.Errorf("squic: listen: %w", err)
 	}
+	// SIP-25: a listening peer punches too. Whichever side dials, both NATs
+	// have to be opened, and only an outbound packet opens one.
+	punch(rawConn, config)
 
 	// Convert server Ed25519 private key to X25519 for DH-based MAC1
 	edPriv, ok := serverCert.PrivateKey.(ed25519.PrivateKey)
@@ -582,6 +625,45 @@ func (l *ServerListener) Close() error {
 }
 
 // Dial connects to a sQUIC server at the given address.
+// MaxPunchTargets is how many addresses one Config.Punch may name.
+const MaxPunchTargets = 4
+
+// PunchDatagrams is how many datagrams are sent to each punch target.
+//
+// More than one because the first may cross the peer's on the way and find its
+// NAT still shut; few, because this is unsolicited traffic to an address a
+// caller named.
+const PunchDatagrams = 3
+
+// punch opens the NAT mapping for each peer, so its packets are not dropped on
+// the way in.
+//
+// One byte, 0x00: a short-header packet for a connection nobody has, which
+// every squic endpoint discards in silence — and never answers, because a
+// stateless reset would be a reply to a caller that has proved nothing.
+//
+// Errors are ignored on purpose. A punch that does not leave is a punch that
+// did not work, and there is nothing to report to a caller who will find that
+// out when the connection does not form.
+func punch(conn *net.UDPConn, config *Config) {
+	if config == nil || len(config.Punch) == 0 {
+		return
+	}
+	targets := config.Punch
+	if len(targets) > MaxPunchTargets {
+		targets = targets[:MaxPunchTargets]
+	}
+	for _, target := range targets {
+		addr, err := net.ResolveUDPAddr("udp", target)
+		if err != nil {
+			continue
+		}
+		for i := 0; i < PunchDatagrams; i++ {
+			_, _ = conn.WriteToUDP([]byte{0x00}, addr)
+		}
+	}
+}
+
 // serverPubKey is the server's raw Ed25519 public key (known out-of-band).
 // The client generates an ephemeral X25519 key pair for DH-based MAC1.
 func Dial(ctx context.Context, addr string, serverPubKey []byte, config *Config) (*quic.Conn, error) {
@@ -590,10 +672,23 @@ func Dial(ctx context.Context, addr string, serverPubKey []byte, config *Config)
 		return nil, fmt.Errorf("squic: resolve addr: %w", err)
 	}
 
-	rawConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	// Bind what the caller asked for, or an ephemeral port. A caller pinning a
+	// local address (SIP-25) is taken at its word; mismatching the peer's family
+	// is then its own error and is reported as the dial's.
+	bind := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+	if config != nil && config.LocalBind != "" {
+		bind, err = net.ResolveUDPAddr("udp", config.LocalBind)
+		if err != nil {
+			return nil, fmt.Errorf("squic: resolve LocalBind: %w", err)
+		}
+	}
+	rawConn, err := net.ListenUDP("udp", bind)
 	if err != nil {
 		return nil, fmt.Errorf("squic: listen: %w", err)
 	}
+	// Before quic-go owns the socket: the mapping has to exist before the
+	// handshake starts, and this is the only moment the raw socket is in hand.
+	punch(rawConn, config)
 
 	// Reject an envelope version nobody defines, here, where the caller can
 	// see it. Left to run it produces an envelope every server drops, so the

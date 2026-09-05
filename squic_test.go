@@ -1154,3 +1154,192 @@ func TestServerListenerReportsItsPublicKey(t *testing.T) {
 	}
 	conn.CloseWithError(0, "")
 }
+
+// SIP-25: a dial can be told which local port to leave from, which is the thing
+// hole punching turns on — a NAT maps an internal ip:port to an external one,
+// and a peer is reachable only through the mapping that made it.
+//
+// The negative half is in the same test and is the point: the *default* dial
+// gets a fresh port every time, which is what makes an ordinary dial useless
+// for punching.
+func TestDialCanBePinnedToALocalPort(t *testing.T) {
+	cert, pubKey, err := squic.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := squic.Listen("udp", "127.0.0.1:0", cert, pubKey, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	seen := make(chan string, 3)
+	go func() {
+		for i := 0; i < 3; i++ {
+			c, err := ln.Accept(context.Background())
+			if err != nil {
+				return
+			}
+			seen <- c.RemoteAddr().String()
+		}
+	}()
+
+	// A port this test owns: bound, read back, released. Racy in principle and
+	// fine here — the point is that squic uses what it is given.
+	probe, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chosen := probe.LocalAddr().String()
+	probe.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	pinned, err := squic.Dial(ctx, ln.Addr().String(), pubKey, &squic.Config{LocalBind: chosen})
+	if err != nil {
+		t.Fatalf("pinned dial: %v", err)
+	}
+	defer pinned.CloseWithError(0, "")
+
+	a, err := squic.Dial(ctx, ln.Addr().String(), pubKey, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.CloseWithError(0, "")
+	b, err := squic.Dial(ctx, ln.Addr().String(), pubKey, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.CloseWithError(0, "")
+
+	var observed []string
+	for i := 0; i < 3; i++ {
+		select {
+		case s := <-seen:
+			observed = append(observed, s)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("the server accepted only %d connections", len(observed))
+		}
+	}
+
+	// What the server saw is the assertion. The mapping a peer would have to be
+	// told about is the source port, and for the pinned dial it is the one
+	// asked for.
+	found := false
+	var others []string
+	for _, o := range observed {
+		if o == chosen {
+			found = true
+		} else {
+			others = append(others, o)
+		}
+	}
+	if !found {
+		t.Fatalf("the pinned dial did not arrive from %s: %v", chosen, observed)
+	}
+	// And the negative half: the other two came from two different,
+	// unasked-for ports, which is why an ordinary dial cannot be punched
+	// through.
+	if len(others) != 2 || others[0] == others[1] {
+		t.Fatalf("two default dials shared a port, which they must not: %v", others)
+	}
+}
+
+// The punch datagrams go out, and are dropped in silence by whatever receives
+// them — one byte, a short header for a connection nobody has. A squic endpoint
+// on the other end must not answer: a reply would be a reply to a caller that
+// has proved nothing.
+func TestPunchIsSentAndAnsweredByNothing(t *testing.T) {
+	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+
+	cert, pubKey, err := squic.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := squic.Listen("udp", "127.0.0.1:0", cert, pubKey,
+		&squic.Config{Punch: []string{peer.LocalAddr().String()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	buf := make([]byte, 64)
+	for i := 0; i < squic.PunchDatagrams; i++ {
+		if err := peer.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		n, _, err := peer.ReadFromUDP(buf)
+		if err != nil {
+			t.Fatalf("punch %d did not arrive: %v", i, err)
+		}
+		if n != 1 || buf[0] != 0x00 {
+			t.Fatalf("a punch must be one byte 0x00, got %d bytes %x", n, buf[:n])
+		}
+	}
+
+	// And the other direction: a squic endpoint that receives one says nothing
+	// back at all.
+	stranger, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stranger.Close()
+	lnAddr, err := net.ResolveUDPAddr("udp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stranger.WriteToUDP([]byte{0x00}, lnAddr); err != nil {
+		t.Fatal(err)
+	}
+	if err := stranger.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if n, _, err := stranger.ReadFromUDP(buf); err == nil {
+		t.Fatalf("a squic endpoint answered a punch with %d bytes, which a silent server must never do", n)
+	}
+}
+
+// The send primitive is bounded, because it takes a destination from its caller
+// and that is the shape a reflection abuse takes. It amplifies nothing — one
+// byte out per byte asked for — and it will not be pointed at a list.
+func TestPunchListIsBounded(t *testing.T) {
+	var peers []*net.UDPConn
+	var targets []string
+	for i := 0; i < squic.MaxPunchTargets+2; i++ {
+		p, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer p.Close()
+		peers = append(peers, p)
+		targets = append(targets, p.LocalAddr().String())
+	}
+
+	cert, pubKey, err := squic.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := squic.Listen("udp", "127.0.0.1:0", cert, pubKey, &squic.Config{Punch: targets})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	buf := make([]byte, 64)
+	for i, p := range peers {
+		if err := p.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+		_, _, err := p.ReadFromUDP(buf)
+		if i < squic.MaxPunchTargets && err != nil {
+			t.Errorf("target %d was inside the cap and got nothing", i)
+		}
+		if i >= squic.MaxPunchTargets && err == nil {
+			t.Errorf("target %d was past the cap and was punched anyway", i)
+		}
+	}
+}
