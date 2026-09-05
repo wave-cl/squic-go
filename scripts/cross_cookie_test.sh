@@ -18,6 +18,13 @@
 # reports at least one challenge issued and one MAC2 verified — otherwise a run
 # that quietly skipped the cookie path would pass.
 #
+# This drives the same two probes as cross_peerkey_test.sh, in the same shape:
+# the client runs in the foreground, so a probe that lingers instead of ending
+# the exchange costs a full max_idle_timeout (30s) on every row. Both halves of
+# that are in the probes — servers close the connection before exiting, clients
+# bound the read of the reply — and both have to stay. See the longer note in
+# cross_peerkey_test.sh, where the same regression cost 2m03s.
+#
 # Needs squic-rust checked out as a sibling of squic-go by default; override
 # with SQUIC_RUST_DIR.
 set -u
