@@ -27,6 +27,22 @@ func isQUICInitial(data []byte) bool {
 	return data[0]&0xF0 == 0xC0
 }
 
+// isQUICZeroRTT reports whether a packet is a QUIC 0-RTT packet: long header,
+// packet type 0x01, so first byte & 0xF0 == 0xD0.
+//
+// sQUIC does not carry 0-RTT. The envelope proves possession of the server's
+// key and of a Diffie-Hellman shared secret, and it is attached to the Initial;
+// a standalone 0-RTT datagram arrives with none of that, so a stack that
+// accepts one is taking application data from a caller this transport has not
+// authenticated — past the gate, past MAC1, and past the whitelist SIP-8
+// enforces on the X25519 field the datagram does not carry.
+func isQUICZeroRTT(data []byte) bool {
+	if len(data) < 5 {
+		return false
+	}
+	return data[0]&0xF0 == 0xD0
+}
+
 // isShortHeader reports whether a packet has a QUIC short header: header-form
 // bit clear, fixed bit set. Everything after the handshake looks like this and
 // nothing before it does.
@@ -926,6 +942,21 @@ func (c *serverConn) validateAndStrip(p []byte, n int, addr *net.UDPAddr) (bool,
 	// nothing. Drop those here, before the stack sees them. See versionAccepted
 	// for why the gate is on the version and not the packet type.
 	if isLongHeader(p[:n]) && !versionAccepted(p[:n]) {
+		return false, 0
+	}
+
+	// 0-RTT carries no envelope and cannot be given one: it is sent before the
+	// handshake this transport authenticates, so there is no Initial of its own
+	// to wrap and no shared secret yet to key MAC1 with. A stack that accepts a
+	// standalone 0-RTT datagram is taking application data from a caller who
+	// passed no gate, no MAC1 and no whitelist. sQUIC does not support 0-RTT;
+	// this is where that is enforced.
+	//
+	// Only a datagram that starts with 0-RTT. One coalescing an Initial in
+	// front of it begins with 0xC0, so it is envelope-checked as a whole —
+	// MAC1 covers every byte, the 0-RTT among them — and quic-go splits it
+	// afterwards.
+	if isQUICZeroRTT(p[:n]) {
 		return false, 0
 	}
 

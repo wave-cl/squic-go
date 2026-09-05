@@ -79,10 +79,6 @@ type Config struct {
 	// Default: false.
 	EnableDatagrams bool
 
-	// Enable0RTT allows 0-RTT resumption. Has replay attack implications.
-	// Default: false.
-	Enable0RTT bool
-
 	// ClientKey is an optional hex-encoded Ed25519 private key seed (64 hex chars).
 	// When set, Dial() uses this persistent identity instead of generating an ephemeral one.
 	// The client's X25519 public key is derived from this for MAC1 and whitelist matching.
@@ -190,9 +186,6 @@ func (c *Config) quicConfig() *quic.Config {
 		}
 		if c.EnableDatagrams {
 			qc.EnableDatagrams = true
-		}
-		if c.Enable0RTT {
-			qc.Allow0RTT = true
 		}
 	}
 

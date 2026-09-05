@@ -60,9 +60,12 @@ func TestUnsupportedVersionLongHeaderIsDropped(t *testing.T) {
 }
 
 // The other half, and the reason the gate is on the version and not the packet
-// type: a client's Handshake and 0-RTT packets are long-headed too. Dropping
-// every non-Initial long header would break each connection at the second
-// flight, so a recognised version must still pass straight through.
+// type: a client's Handshake packets are long-headed too. Dropping every
+// non-Initial long header would break each connection at the second flight, so
+// a recognised version must still pass straight through.
+//
+// 0-RTT is the one exception, and it is not here for that reason — see
+// TestZeroRTTIsDropped.
 func TestSupportedVersionNonInitialPassesThrough(t *testing.T) {
 	sc, conn := testServerConn(t)
 	defer conn.Close()
@@ -70,7 +73,7 @@ func TestSupportedVersionNonInitialPassesThrough(t *testing.T) {
 	// Driven off the declared set, so the gate and the set cannot drift apart.
 	for _, sv := range supportedVersions {
 		v := uint32(sv)
-		for _, first := range []byte{0xE0, 0xD0, 0xF0} { // Handshake, 0-RTT, Retry
+		for _, first := range []byte{0xE0, 0xF0} { // Handshake, Retry
 			p := probe(first, v, 1200)
 			ok, n := sc.validateAndStrip(p, len(p), nil)
 			if !ok {
@@ -85,6 +88,31 @@ func TestSupportedVersionNonInitialPassesThrough(t *testing.T) {
 	short := []byte{0x40, 1, 2, 3, 4, 5}
 	if ok, n := sc.validateAndStrip(short, len(short), nil); !ok || n != len(short) {
 		t.Errorf("short header not passed through: ok=%v n=%d", ok, n)
+	}
+}
+
+// 0-RTT is application data offered *before* the handshake this transport
+// authenticates, so it arrives with no envelope on it at all — no gate, no
+// MAC1, and no X25519 field for SIP-8 to check a whitelist against. It has to
+// be refused, at every version the stack would parse.
+//
+// The refusal has to be specific, and the second half is the control that keeps
+// it so: Handshake carries the client's second flight, so a drop written one
+// bit wider would break every connection while still passing the first check.
+func TestZeroRTTIsDropped(t *testing.T) {
+	sc, conn := testServerConn(t)
+	defer conn.Close()
+
+	for _, sv := range supportedVersions {
+		v := uint32(sv)
+		p := probe(0xD0, v, 1200)
+		if ok, _ := sc.validateAndStrip(p, len(p), nil); ok {
+			t.Errorf("an unauthenticated 0-RTT datagram at version %#x reached the QUIC stack", v)
+		}
+		h := probe(0xE0, v, 1200)
+		if ok, n := sc.validateAndStrip(h, len(h), nil); !ok || n != len(h) {
+			t.Errorf("the client's second flight was dropped at version %#x: ok=%v n=%d", v, ok, n)
+		}
 	}
 }
 
