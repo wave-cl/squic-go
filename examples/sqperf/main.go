@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	squic "github.com/wave-cl/squic-go"
 	"github.com/quic-go/quic-go"
+	squic "github.com/wave-cl/squic-go"
 )
 
 var (
@@ -83,7 +83,7 @@ func runServer(port int) error {
 
 	addr := fmt.Sprintf(":%d", port)
 	ln, err := squic.Listen("udp", addr, cert, pubKey, &squic.Config{
-		MaxIdleTimeout:    60 * time.Second,
+		MaxIdleTimeout:     60 * time.Second,
 		MaxIncomingStreams: 200,
 	})
 	if err != nil {
@@ -173,7 +173,7 @@ func runClient(addr string, mode string, dur time.Duration) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	conn, err := squic.Dial(ctx, addr, pubKey, &squic.Config{
-		MaxIdleTimeout:    60 * time.Second,
+		MaxIdleTimeout:     60 * time.Second,
 		MaxIncomingStreams: 200,
 	})
 	cancel()
@@ -374,4 +374,3 @@ func runBidir(conn *quic.Conn, dur time.Duration) error {
 	wg.Wait()
 	return nil
 }
-
