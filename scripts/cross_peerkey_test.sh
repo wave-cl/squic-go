@@ -16,6 +16,22 @@
 # derivation check and the DCID join all agree on the wire between the two
 # implementations.
 #
+# The whole matrix should finish in a couple of seconds. If it starts taking
+# minutes, the cause is almost certainly an idle timeout rather than slow work:
+# each client runs in the foreground here, so a client left waiting on a reply
+# that never comes costs this script the full max_idle_timeout (30s) per row.
+# It was 2m03s until both probes were taught to end the exchange, and the fix
+# has a half in each of them:
+#   * the servers close the connection before the process exits, so the client
+#     gets a CONNECTION_CLOSE instead of waiting to time out. Returning from
+#     main after writing the reply is not enough — the reply usually loses the
+#     race with process exit, and no close frame is ever sent.
+#   * the clients bound the read of that reply, so a peer that dies silently
+#     costs seconds rather than the idle timeout.
+# Keep both halves. Either one alone leaves some of the rows slow, and the
+# symptom misleads: the delay is charged to the client that waits, but caused
+# by the server that left. Time every cell of the matrix before blaming a side.
+#
 # Needs squic-rust checked out as a sibling of squic-go by default; override
 # with SQUIC_RUST_DIR. Builds both probes, then runs the 4x matrix.
 set -u
