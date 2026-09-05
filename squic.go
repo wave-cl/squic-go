@@ -259,6 +259,40 @@ type ServerListener struct {
 // serverCert is the TLS certificate (from GenerateKeyPair or LoadKeyPair).
 // serverPubKey is the raw Ed25519 public key bytes (distributed to clients out-of-band).
 func Listen(network, addr string, serverCert tls.Certificate, serverPubKey []byte, config *Config) (*ServerListener, error) {
+	// The mirror of the guard in Dial, and the one that costs more to be
+	// without. A server told to accept a version this build cannot parse does
+	// not fail: it binds, it reports itself healthy, and it drops every Initial
+	// that arrives in silence, because SIP-6 requires exactly that of anything
+	// it cannot validate. The operator sees a live process and a dead port with
+	// nothing anywhere saying why.
+	//
+	// This is not hypothetical. ex ran accepted_envelope_versions = [3] right
+	// up to the v4 cut, and installing the binary without editing that line in
+	// the same breath would have taken the exchange down without one error.
+	//
+	// Every named version must be parsable, not merely one of them. A set like
+	// [3, 4] on a v4-only build is the quieter half of the same fault: v4
+	// callers connect, v3 callers are dropped without a word, and the operator
+	// believes both are served.
+	//
+	// Nothing checks for an empty set here, unlike squic-rust:
+	// acceptedEnvelopeVersions resolves nil or empty to the default, so an
+	// empty set cannot reach the server. Rust's Config carries the list
+	// directly and needs its own check.
+	var unparsable []uint8
+	for _, v := range config.acceptedEnvelopeVersions() {
+		if _, ok := TrailerLen(Hdr(v, false)); !ok {
+			unparsable = append(unparsable, v)
+		}
+	}
+	if len(unparsable) > 0 {
+		return nil, fmt.Errorf(
+			"squic: AcceptedEnvelopeVersions names %v, which this build cannot parse "+
+				"(it implements %d); a server accepting only versions it cannot parse "+
+				"binds successfully and then drops every Initial in silence",
+			unparsable, EnvelopeV4)
+	}
+
 	udpAddr, err := net.ResolveUDPAddr(network, addr)
 	if err != nil {
 		return nil, fmt.Errorf("squic: resolve addr: %w", err)

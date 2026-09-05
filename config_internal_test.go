@@ -363,3 +363,45 @@ func TestDialRejectsAnUnknownEnvelopeVersion(t *testing.T) {
 		t.Errorf("error does not name the cause: %v", err)
 	}
 }
+
+// The mirror, and the one with the higher price for being absent. A server told
+// to accept only versions it cannot parse binds, reports itself healthy, and
+// then drops every Initial without a word — SIP-6 requires the silence, so
+// nothing distinguishes it from a firewall.
+//
+// [3] is the case that matters rather than a synthetic one: it is what ex had
+// in its config file up to the v4 cut, and installing a v4 binary without
+// editing that line would have taken the exchange down in silence.
+func TestListenRejectsAnAcceptSetItCannotParse(t *testing.T) {
+	cert, pubKey, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wholly unparsable, including ex's real pre-cut config; then the quieter
+	// half, a set mixing parsable and unparsable versions, which would serve v4
+	// callers and silently drop v3 callers while the operator believed both
+	// were served.
+	for _, bad := range [][]uint8{{3}, {1}, {0}, {2, 3}, {5, 255}, {3, 4}} {
+		ln, err := Listen("udp", "127.0.0.1:0", cert, pubKey,
+			&Config{AcceptedEnvelopeVersions: bad})
+		if err == nil {
+			ln.Close()
+			t.Errorf("Listen bound on an accept set it cannot parse: %v", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "AcceptedEnvelopeVersions") {
+			t.Errorf("%v was refused for the wrong reason: %v", bad, err)
+		}
+	}
+
+	// The control. The implemented set gets past the guard and binds, so the
+	// loop above is failing on the version and not on something incidental to
+	// every Listen in it.
+	ln, err := Listen("udp", "127.0.0.1:0", cert, pubKey,
+		&Config{AcceptedEnvelopeVersions: []uint8{EnvelopeV4}})
+	if err != nil {
+		t.Fatalf("the implemented version was refused by the guard: %v", err)
+	}
+	ln.Close()
+}

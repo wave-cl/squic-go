@@ -104,6 +104,11 @@ func runServer(port int, serverKeyHex string, underLoad bool) {
 		_, _ = stream.Write([]byte("ok"))
 		stream.Close()
 	}
+	// Tell the client we are done. Without this the process just exits, the
+	// client never sees a CONNECTION_CLOSE, and it waits out the full 30s idle
+	// timeout on a probe that has already succeeded — which is what made the
+	// go-server rows of scripts/cross_peerkey_test.sh dominate its wall time.
+	conn.CloseWithError(0, "")
 }
 
 func runClient(host string, port int, serverPubHex, clientKeyHex string, advertise bool, envelopeVersion uint8) {
