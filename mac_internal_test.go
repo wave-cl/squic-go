@@ -116,15 +116,26 @@ func TestLoadMonitorRaisesAndClearsUnderLoad(t *testing.T) {
 	}
 
 	// Push the counter past the threshold and let one monitor tick see it.
-	sc.dhCount.Store(50)
+	sc.loadCount.Store(50)
 	if !waitFor(func() bool { return sc.underLoad.Load() }) {
 		t.Fatal("the monitor never raised under-load with the count above the threshold")
 	}
 
-	// The monitor resets the count each tick, so with no further work it falls
-	// back on its own — an operator does not have to clear it.
-	if !waitFor(func() bool { return !sc.underLoad.Load() }) {
-		t.Fatal("under-load never cleared once the offered load stopped")
+	// Hysteresis: a brief lull shorter than the release debounce must NOT clear
+	// under-load. This is the anti-oscillation guarantee — a sustained flood
+	// whose 1s windows dip below the threshold now and then must not flap the
+	// server out of under-load, because Initials forwarded while it is clear
+	// evade the cookie defence. The engaging tick zeroed the debounce, so three
+	// quiet seconds are still short of the release window.
+	sc.loadCount.Store(0)
+	if waitForDur(func() bool { return !sc.underLoad.Load() }, 3*time.Second) {
+		t.Fatal("under-load cleared during a brief lull; hysteresis must hold through short dips")
+	}
+
+	// A sustained lull does clear it on its own — an operator does not have to.
+	// This takes the release debounce, so allow well beyond it.
+	if !waitForDur(func() bool { return !sc.underLoad.Load() }, 8*time.Second) {
+		t.Fatal("under-load never cleared after a sustained lull")
 	}
 }
 
@@ -174,6 +185,20 @@ func rotate(c *serverConn) {
 
 func waitFor(cond func() bool) bool {
 	for i := 0; i < 60; i++ {
+		if cond() {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
+}
+
+// waitForDur polls cond until it holds or the duration elapses. Used by the
+// hysteresis test, whose windows are measured in seconds, not the fixed budget
+// waitFor gives.
+func waitForDur(cond func() bool, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
 		if cond() {
 			return true
 		}
