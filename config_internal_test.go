@@ -54,7 +54,7 @@ func TestZeroThresholdStartsNoCookieMachinery(t *testing.T) {
 	if sc.underLoad.Load() {
 		t.Fatal("underLoad set with the defence disabled")
 	}
-	sc.dhCount.Add(1_000_000)
+	sc.loadCount.Add(1_000_000)
 	if sc.underLoad.Load() {
 		t.Fatal("underLoad latched despite the monitor being disabled")
 	}

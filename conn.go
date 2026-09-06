@@ -673,6 +673,7 @@ type serverConn struct {
 	prevCookieSecret [32]byte     // previous secret, for the rotation grace period
 	underLoad        atomic.Bool  // true when DH rate exceeds threshold
 	dhCount          atomic.Int64 // DH operations in current second
+	loadCount        atomic.Int64 // offered key-holder work this second (DHs + cookie challenges); the monitor's signal, which stays high even while under-load suppresses DHs
 	cookieReplies    atomic.Int64 // challenges issued since start
 	mac2Verified     atomic.Int64 // Initials admitted on a valid MAC2
 	// accepted counts Initials admitted per envelope version, indexed as
@@ -753,16 +754,39 @@ func (c *serverConn) rotateCookieSecrets() {
 	}
 }
 
-// monitorLoad tracks DH operations per second and toggles underLoad.
+// monitorLoad tracks DH operations per second and toggles underLoad, with
+// hysteresis: it enters under-load the instant the rate crosses the threshold,
+// but leaves only after the rate has stayed at or below a low-water mark (half
+// the threshold) for releaseAfter consecutive seconds. A single-threshold
+// monitor oscillates under a sustained flood — it drops out of under-load on
+// any 1s window that dips below the line, and Initials forwarded in those
+// windows evade the cookie defence, which is exactly when it must hold. The two
+// marks and the debounce turn a steady flood into a steady under-load state.
 func (c *serverConn) monitorLoad() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
+	const releaseAfter = 5 // consecutive quiet seconds before leaving under-load
+	lowWater := c.loadThreshold / 2
+	quiet := 0
 	for range ticker.C {
-		count := c.dhCount.Swap(0)
-		if count > c.loadThreshold {
+		count := c.loadCount.Swap(0)
+		switch {
+		case count > c.loadThreshold:
+			// Above the high-water mark: engage immediately, reset the debounce.
+			quiet = 0
 			c.underLoad.Store(true)
-		} else {
-			c.underLoad.Store(false)
+		case c.underLoad.Load():
+			// Engaged. Only a sustained lull below the low-water mark releases
+			// it; anything above low-water resets the debounce and holds.
+			if count <= lowWater {
+				quiet++
+				if quiet >= releaseAfter {
+					c.underLoad.Store(false)
+					quiet = 0
+				}
+			} else {
+				quiet = 0
+			}
 		}
 	}
 }
@@ -1055,6 +1079,10 @@ func (c *serverConn) validateEnvelope(hdr uint8, p []byte, n int, addr *net.UDPA
 		case addr != nil && c.gateMatchesCookie(hdr, covered, gate, addr.IP):
 			c.mac2Verified.Add(1)
 		case VerifyGate(hdr, c.gateKey[:], covered, gate):
+			// A challenge is offered load too: counting it keeps the monitor
+			// engaged under a sustained key-gate flood, which challenges rather
+			// than DHs and would otherwise starve a DH-only signal to zero.
+			c.loadCount.Add(1)
 			return outcomeChallenge, 0
 		default:
 			return outcomeDrop, 0
@@ -1084,6 +1112,7 @@ func (c *serverConn) validateEnvelope(hdr uint8, p []byte, n int, addr *net.UDPA
 
 	// Step 5: DH + MAC1 verification (expensive)
 	c.dhCount.Add(1)
+	c.loadCount.Add(1)
 	shared, dhErr := X25519(c.serverX25519Priv, clientPub)
 	if dhErr != nil {
 		return outcomeDrop, 0
