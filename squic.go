@@ -24,6 +24,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -415,6 +416,21 @@ func Listen(network, addr string, serverCert tls.Certificate, serverPubKey []byt
 	// the Tracer looks the CID up in the peer table and fills it, and PeerKey
 	// reads it back. No wire change; this only surfaces information already
 	// verified.
+	// Cap NEW unvalidated connection creations per second. quic-go allocates and
+	// holds a connection for the handshake timeout on the first Initial of a fresh
+	// DCID; every Initial that clears the envelope MAC1 reaches quic-go, and any
+	// holder of the PUBLISHED server key can forge a valid MAC1 for its own key
+	// with a fresh DCID, so a flood would grow RSS without bound (measured ~2.8 GB,
+	// non-recovering) whenever the whitelist is off. Beyond the budget, quic-go
+	// issues a stateless Retry and allocates nothing until the caller returns the
+	// token: a flood never answers, so it creates no state, while honest clients
+	// sit under the budget and never see a Retry. Gating on the load flag does not
+	// work — the 1s monitor oscillates and lets bursts through its "not under load"
+	// windows. This is quic-go's documented use of VerifySourceAddress.
+	const newConnBudgetPerSec = 100
+	var vsaMu sync.Mutex
+	var vsaWindow int64
+	var vsaCount int
 	tr := &quic.Transport{
 		Conn: wrappedConn,
 		// Belt and braces with the version gate in validateAndStrip. A Version
@@ -423,6 +439,18 @@ func Listen(network, addr string, serverCert tls.Certificate, serverPubKey []byt
 		// those packets reaching quic-go, and this stops quic-go answering if
 		// one ever does.
 		DisableVersionNegotiationPackets: true,
+		VerifySourceAddress: func(net.Addr) bool {
+			now := time.Now().Unix()
+			vsaMu.Lock()
+			if now != vsaWindow {
+				vsaWindow = now
+				vsaCount = 0
+			}
+			vsaCount++
+			over := vsaCount > newConnBudgetPerSec
+			vsaMu.Unlock()
+			return over
+		},
 		ConnContext: func(ctx context.Context, _ *quic.ClientInfo) (context.Context, error) {
 			return context.WithValue(ctx, peerKeyCtxKey{}, &peerKeyHolder{}), nil
 		},
