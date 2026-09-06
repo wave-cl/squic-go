@@ -22,9 +22,11 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -143,6 +145,21 @@ type Config struct {
 	// turn the cookie defence off, pass a negative value. (squic-rust spells
 	// the same two states Option::None and Some(0), which it can distinguish.)
 	LoadThreshold int64
+
+	// MaxConnections caps the number of concurrently-established connections.
+	//
+	// Each accepted connection can hold up to its receive window (see
+	// ReceiveWindow, ~10 MB by default) of unread data, and the transport has
+	// no other ceiling on how many may be open at once — so a caller that
+	// completes handshakes and holds connections open can drive server memory
+	// to N × the window. This bounds N: once that many connections are live,
+	// further ones are refused before they establish.
+	//
+	// Zero (the default) means unlimited — the historical behaviour. A public,
+	// whitelist-off deployment should set a finite value sized to its memory
+	// budget (MaxConnections × ReceiveWindow). Ignored on dialed connections.
+	// (squic-rust spells this Config.max_connections, Option<u64>.)
+	MaxConnections int64
 
 	// EnvelopeVersion is the envelope version this client emits (SIP-29).
 	//
@@ -293,6 +310,18 @@ func (c *Config) loadThreshold() int64 {
 	return c.LoadThreshold
 }
 
+// maxConnections resolves the concurrent-connection cap; 0 means unlimited.
+func (c *Config) maxConnections() int64 {
+	if c == nil || c.MaxConnections < 0 {
+		return 0
+	}
+	return c.MaxConnections
+}
+
+// errAtCapacity is returned from ConnContext to refuse a connection once the
+// server is at its MaxConnections cap.
+var errAtCapacity = errors.New("squic: server at connection capacity")
+
 func (c *Config) envelopeVersion() uint8 {
 	if c == nil || c.EnvelopeVersion == 0 {
 		return EnvelopeV4 // unset; the only version implemented
@@ -431,6 +460,12 @@ func Listen(network, addr string, serverCert tls.Certificate, serverPubKey []byt
 	var vsaMu sync.Mutex
 	var vsaWindow int64
 	var vsaCount int
+	// Cap on concurrently-established connections (0 = unlimited). Counted in
+	// ConnContext, which quic-go calls once per accepted connection and whose
+	// context it cancels on close — so the Done watcher is the decrement, and
+	// returning an error refuses the connection before it allocates.
+	maxConns := config.maxConnections()
+	var liveConns atomic.Int64
 	tr := &quic.Transport{
 		Conn: wrappedConn,
 		// Belt and braces with the version gate in validateAndStrip. A Version
@@ -452,6 +487,18 @@ func Listen(network, addr string, serverCert tls.Certificate, serverPubKey []byt
 			return over
 		},
 		ConnContext: func(ctx context.Context, _ *quic.ClientInfo) (context.Context, error) {
+			if maxConns > 0 {
+				if liveConns.Add(1) > maxConns {
+					liveConns.Add(-1)
+					return ctx, errAtCapacity // refused before it establishes
+				}
+				// ctx is cancelled when this connection closes (or its
+				// handshake fails), so this is the matching decrement.
+				go func() {
+					<-ctx.Done()
+					liveConns.Add(-1)
+				}()
+			}
 			return context.WithValue(ctx, peerKeyCtxKey{}, &peerKeyHolder{}), nil
 		},
 	}
